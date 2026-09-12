@@ -115,6 +115,21 @@ const RULES = [
     fix: "该 token 泄露等于 Windows 可被远程执行命令，必须换新",
   },
   {
+    // 部署路径不是密钥，但会暴露目录结构，且别人 clone 后路径不对。
+    //
+    // 【为什么定 low 而不是 medium】本机仓库里 `<PI2X_ROOT>` 是**正确且必需**的：
+    // prompt/ 里那些 `node <PI2X_ROOT>/scripts/xxx.mjs` 是模型运行时照着执行的命令，
+    // 改了 bot 当场失效。所以本地扫描必然命中，报成 medium 只会变成长期噪音。
+    // 归一化由 export-public 在**导出副本**上完成 —— 导出后扫描为 0。
+    // 这条留 low 是为了提示「新文件若不在归一化覆盖范围内（如 .txt、无扩展名），
+    // 需要单独处理」。
+    id: "local-path",
+    severity: "low",
+    desc: "写死的本机部署路径",
+    re: /\/opt\/pi2x|D:\\PI2X/g,
+    fix: "导出时由 export-public.mjs 归一化为 <PI2X_ROOT>；新文件务必走同一规则",
+  },
+  {
     id: "private-ip",
     severity: "medium",
     desc: "内网 IP（暴露网络拓扑）",

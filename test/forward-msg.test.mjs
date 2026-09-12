@@ -59,12 +59,12 @@ const REAL_SHAPE = {
   data: {
     messages: [
       {
-        self_id: 2788144969, user_id: 1094950020, time: 1788684151, message_id: 1253819764,
+        self_id: 1000000001, user_id: 1094950020, time: 1788684151, message_id: 1253819764,
         sender: { user_id: 1094950020, nickname: "小灰灰", card: "" },
         message: [{ type: "text", data: { text: "方向二：短视频平台上的国家安全科普" } }],
       },
       {
-        self_id: 2788144969, user_id: 1234, time: 1788684200, message_id: 1253819800,
+        self_id: 1000000001, user_id: 1234, time: 1788684200, message_id: 1253819800,
         sender: { user_id: 1234, nickname: "故梦", card: "" },
         message: [{ type: "text", data: { text: "那各位挑选一下吧" } }],
       },

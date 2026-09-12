@@ -26,7 +26,8 @@ const config = JSON.parse(fs.readFileSync(path.join(ROOT, "config.json"), "utf8"
 const WHITELIST_FILE = path.join(ROOT, "whitelist.json");
 const { createWhitelist } = await import(path.join(ROOT, "lib", "whitelist.mjs"));
 const { QQBridge } = await import(path.join(ROOT, "lib", "qqbridge.mjs"));
-const { checkGrant, checkRevoke } = await import(path.join(ROOT, "lib", "op-policy.mjs"));
+const { checkGrant, checkRevoke, levelOf, PRESET_LEVEL } = await import(path.join(ROOT, "lib", "op-policy.mjs"));
+const { riskOf } = await import(path.join(ROOT, "lib", "napcat-api.mjs"));
 
 // ── 参数解析 ──
 let uid = "";
@@ -168,9 +169,23 @@ async function main() {
       case "napcat": {
         const params = rest[1] ? JSON.parse(rest[1]) : {};
         const act = String(rest[0] ?? "");
-        // 写/管理类接口仅 admin；只读（get_/search_/…）对已授权用户放行
-        if (WRITE_API.test(act) && levelOf(uid) < PRESET_LEVEL.admin) {
-          out = `拒绝：${act} 为写/管理类接口，仅管理员可调用`;
+        // 写/管理类接口仅 admin；只读（get_/search_/…）对已授权用户放行。
+        //
+        // 【修的是真漏洞，不是写法问题】原先这里用 `levelOf(uid) < PRESET_LEVEL.admin`，
+        // 但 levelOf / PRESET_LEVEL 两个符号**根本没导入**（本文件只导入了 checkGrant/checkRevoke）。
+        // 后果分两层，都被实测复现：
+        //   1) 命中 WRITE_API 时判据先求值 → ReferenceError，整条 napcat 路径不可用；
+        //   2) 不命中该正则的接口（get_cookies / get_csrf_token / get_credentials /
+        //      bot_exit / clean_cache / _del_group_notice …）——因 `&&` 短路，左侧为 false
+        //      时右侧**根本不求值**，levelOf 从未被调用，守卫等于不存在，直接执行。
+        //      这些接口在 lib/napcat-api.mjs 里全标了 RED，而 operator 预设带 tools.napcat，
+        //      于是 operator 能直接取 QQ 登录凭据或搞破坏（实测 get_csrf_token 真的返回了 token）。
+        //
+        // 现在两道判据都保留并叠加，且**刻意选更严的一侧**（绝不因修 bug 而放松）：
+        //   · riskOf(act) === "red"  → 风险表判定的破坏/凭证/控制类接口
+        //   · WRITE_API.test(act)    → 原有的写/管理前缀（含 send_，保持原策略不变）
+        if (levelOf(uid) < PRESET_LEVEL.admin && (riskOf(act) === "red" || WRITE_API.test(act))) {
+          out = `拒绝：${act} 属管理/破坏类接口，仅管理员可调用`;
           break;
         }
         out = await bridge.api(act, params);

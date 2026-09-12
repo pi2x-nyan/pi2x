@@ -21,7 +21,7 @@ if pgrep -f "$PATTERN" >/dev/null 2>&1; then
 fi
 
 screen -wipe >/dev/null 2>&1
-screen -dmS ccgo bash -c 'source /etc/profile.d/cred.sh 2>/dev/null; cd /opt/pi2x && exec node scripts/commandcode-proxy.mjs >> logs/cc-go-proxy.log 2>&1'
+screen -dmS ccgo bash -c 'source /etc/profile.d/cred.sh 2>/dev/null; cd <PI2X_ROOT> && exec node scripts/commandcode-proxy.mjs >> logs/cc-go-proxy.log 2>&1'
 sleep 3
 echo "ccgo pid: $(pgrep -f "$PATTERN" | head -1)"
 echo "curl: $(curl -s -m 12 -o /dev/null -w '%{http_code}' http://127.0.0.1:20228/v1/models)"

@@ -8,6 +8,12 @@
  *     改为轮询 location.href + readyState，带超时返回；
  *  4) eval()/screenshot() 均经由带超时的 send()。
  */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** 项目根：由本文件位置推导，避免写死部署路径 */
+const ROOT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
 const DEFAULT_PORT = 9222;
 const DEFAULT_SEND_TIMEOUT = 30000;
 
@@ -177,11 +183,11 @@ export class CdpBrowser {
     const path = await import("node:path");
     if (!outPath) {
       // 默认落点按环境选择：
-      //   · 沙盒用户（operator 等）→ 自己的沙盒目录（沙箱里 /opt/pi2x/tmp 不可见，
+      //   · 沙盒用户（operator 等）→ 自己的沙盒目录（沙箱里 <PI2X_ROOT>/tmp 不可见，
       //     写不进去会直接失败；PI2X_SANDBOX_DIR 由 sandbox bash 注入）
-      //   · 管理员 → /opt/pi2x/tmp（原来的默认值，保持不变）
+      //   · 管理员 → <PI2X_ROOT>/tmp（原来的默认值，保持不变）
       const sbx = process.env.PI2X_SANDBOX_DIR;
-      const dir = sbx ? path.join(sbx, "screenshots") : process.env.PI2X_SCREENSHOT_DIR || "/opt/pi2x/tmp";
+      const dir = sbx ? path.join(sbx, "screenshots") : process.env.PI2X_SCREENSHOT_DIR || path.join(ROOT_DIR, "tmp");
       try { fs.mkdirSync(dir, { recursive: true }); } catch {}
       outPath = path.join(dir, `shot-${Date.now()}.png`);
     }

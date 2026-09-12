@@ -17,7 +17,7 @@ QQ 用户 ⇄ NapCat (OneBot11 WS) ⇄ PI2X Bridge ⇄ pi AgentSession
 ## 目录结构
 
 ```
-/opt/pi2x/
+<PI2X_ROOT>/
 ├── bridge.mjs                # 主入口（启动/路由/回复/图片收集）
 ├── config.json               # 配置（NapCat/模型/权限/记忆/winShell）
 ├── control.mjs
@@ -107,10 +107,10 @@ QQ 用户 ⇄ NapCat (OneBot11 WS) ⇄ PI2X Bridge ⇄ pi AgentSession
 
 ## 跨机能力（win-shell）
 
-Windows 端 `win-agent`（`D:\PI2X\win-agent\service.mjs`，端口 8123，Bearer token）：
+Windows 端 `win-agent`（`<PI2X_ROOT_WIN>\win-agent\service.mjs`，端口 8123，Bearer token）：
 - `/exec` 执行命令（cmd/powershell）、`/pi/run` 跑 Windows pi 子代理、`/file/read`、`/file/write`、`/ping`、`/health`、`/pi/abort`
 - 开机自启（Startup 文件夹 PI2X-WinShell.vbs）
-- 临时文件：Linux `/opt/pi2x/tmp/`，Windows `D:\PI2X\tmp\`
+- 临时文件：Linux `<PI2X_ROOT>/tmp/`，Windows `<PI2X_ROOT_WIN>\tmp\`
 
 ## 命令前缀
 

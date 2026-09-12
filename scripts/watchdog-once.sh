@@ -46,7 +46,7 @@ fi
 
 check_ok() {
   ss -tln 2>/dev/null | grep -q ':3001' || return 1
-  node /opt/pi2x/scripts/check-login.mjs >/dev/null 2>&1 || return 1
+  node <PI2X_ROOT>/scripts/check-login.mjs >/dev/null 2>&1 || return 1
   return 0
 }
 

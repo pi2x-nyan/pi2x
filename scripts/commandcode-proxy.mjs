@@ -23,12 +23,18 @@ import { URL } from "node:url";
 // 否则 Node 偶发先试 IPv6 → 黑洞式 ETIMEDOUT（表现为三个账号全部超时）。
 dns.setDefaultResultOrder("ipv4first");
 
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** 项目根：由本文件位置推导，避免写死部署路径 */
+const ROOT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
 const BASE = "https://api.commandcode.ai";
 const CC_VERSION = "0.26.20";
 const PORT = Number(process.env.COMMANDCODE_PROXY_PORT ?? 20228);
 const MODELS_URL = `${BASE}/provider/v1/models`;
 const CATALOG_URL = "https://cdn.jsdelivr.net/npm/command-code@latest/dist/bundled/command-code-knowledge/reference/models.md";
-const POOL_FILE = process.env.COMMANDCODE_POOL_FILE ?? "/opt/pi2x/.cc-pool.json";
+const POOL_FILE = process.env.COMMANDCODE_POOL_FILE ?? path.join(ROOT_DIR, ".cc-pool.json");
 const HEARTBEAT_MS = Number(process.env.COMMANDCODE_HEARTBEAT_MS ?? 5000);
 /** 单次尝试的「等响应头」超时：连接/排队问题快速暴露，而不是挂到客户端超时 */
 const HEADER_TIMEOUT_MS = Number(process.env.COMMANDCODE_HEADER_TIMEOUT_MS ?? 60000);
@@ -179,7 +185,7 @@ function buildEnvelope(body, upstreamModel) {
   if (body.top_p !== undefined) params.top_p = body.top_p;
   if (body.reasoning_effort && ["low", "medium", "high", "xhigh", "max"].includes(body.reasoning_effort)) params.reasoning_effort = body.reasoning_effort;
   return {
-    config: { workingDir: "/opt/pi2x", date: new Date().toISOString().split("T")[0], environment: "linux-arm64", structure: [], isGitRepo: false, currentBranch: "", mainBranch: "", gitStatus: "", recentCommits: [] },
+    config: { workingDir: ROOT_DIR, date: new Date().toISOString().split("T")[0], environment: "linux-arm64", structure: [], isGitRepo: false, currentBranch: "", mainBranch: "", gitStatus: "", recentCommits: [] },
     memory: "", taste: "", skills: null, permissionMode: "standard",
     params,
   };

@@ -67,6 +67,14 @@ const REWRITES = [
   { file: /^config\.example\.json$/, from: /"2x"\s*:/g, to: '"default":' },
   { file: /^lib\/config\.mjs$/, from: /persona\.2x|"2x"/g, to: "persona" },
   { file: /\.(md|mjs|json|sh|ps1)$/, from: /<创建者>/g, to: "<创建者>" },
+  // 本机部署路径归一化。
+  //
+  // 【为什么不能改本地文件】prompt/ 里的 `<PI2X_ROOT>/scripts/xxx.mjs` 是**运行时要用**的：
+  // 模型照着它去执行脚本。改成占位符会让 bot 当场失效。
+  // 所以只在导出副本里替换 —— 公开仓库看不到部署结构，clone 下来的人也不会被
+  // 误导成"必须放在 <PI2X_ROOT>"。
+  { file: /\.(md|mjs|json|sh|ps1)$/, from: /D:\\PI2X/g, to: "<PI2X_ROOT_WIN>" },
+  { file: /\.(md|mjs|json|sh|ps1)$/, from: /\/opt\/pi2x/g, to: "<PI2X_ROOT>" },
   { file: /\.(md|mjs|json)$/, from: /10\.208\.\d+\.\d+/g, to: "<LAN_IP>" },
   { file: /\.(md|mjs|json)$/, from: /10\.126\.\d+\.\d+/g, to: "<OVERLAY_IP>" },
 ];

@@ -4,18 +4,18 @@
 # 说明: 用 scp -r 覆盖同步，删除服务器端 prompt/.git，并抽样 md5 校验。
 
 set -e
-cd "$(dirname "$0")/.."   # 项目根 D:\PI2X
+cd "$(dirname "$0")/.."   # 项目根 <PI2X_ROOT_WIN>
 
 HOST="${1:-${PI2X_SYNC_HOST:-}}"
 [ -z "$HOST" ] && { echo "用法: $0 <user@host>，或设置 PI2X_SYNC_HOST"; exit 2; }
 KEY="${2:-$HOME/.ssh/id_ed25519_22041211AC}"
-REMOTE=/opt/pi2x/prompt
+REMOTE=<PI2X_ROOT>/prompt
 
 echo "==> 1/4 清空服务器端 prompt/（避免残留）"
 ssh -i "$KEY" -o ConnectTimeout=10 "$HOST" "rm -rf $REMOTE" || { echo "✗ 清空失败"; exit 1; }
 
 echo "==> 2/4 scp -r 覆盖同步本地 prompt/ → 服务器"
-scp -i "$KEY" -r prompt "$HOST:/opt/pi2x/" || { echo "✗ 同步失败"; exit 1; }
+scp -i "$KEY" -r prompt "$HOST:<PI2X_ROOT>/" || { echo "✗ 同步失败"; exit 1; }
 
 echo "==> 3/4 删除服务器端 prompt/.git（仅保留提示词文件）"
 ssh -i "$KEY" -o ConnectTimeout=10 "$HOST" "rm -rf $REMOTE/.git"

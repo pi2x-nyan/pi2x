@@ -20,7 +20,12 @@
  *   node browser-cli.mjs [--port 9222] screenshot [outPath]
  *   node browser-cli.mjs [--port 9222] close
  */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { CdpBrowser, getBrowser } from "./browser-lib.mjs";
+
+/** 项目根：由本文件位置推导，避免写死部署路径 */
+const ROOT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 let port = 9222;
 let watchdog = 120000;
@@ -68,7 +73,7 @@ async function ensureChrome(port) {
     );
     return false;
   }
-  const profile = port === 9222 ? "/opt/pi2x/browser-profile" : "/opt/pi2x/browser-profile-op";
+  const profile = port === 9222 ? path.join(ROOT_DIR, "browser-profile") : path.join(ROOT_DIR, "browser-profile-op");
   try { fs.mkdirSync(profile, { recursive: true }); } catch {}
   try {
     spawn(bin, [

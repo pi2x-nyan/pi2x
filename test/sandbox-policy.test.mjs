@@ -64,13 +64,13 @@ test("沙盒不得挂载整个 /etc（里面有密钥文件）", () => {
 test("沙盒不得挂载任何隐私目录（会话/日志/状态/浏览器 profile/记忆库/项目根）", () => {
   const block = sandboxBlock();
   const forbidden = [
-    "/opt/pi2x/sessions",
-    "/opt/pi2x/logs",
-    "/opt/pi2x/state",
-    "/opt/pi2x/browser-profile",
-    "/opt/pi2x/workspace",
-    "/opt/pi2x/agent-dir",
-    "/opt/pi2x/tmp",
+    "<PI2X_ROOT>/sessions",
+    "<PI2X_ROOT>/logs",
+    "<PI2X_ROOT>/state",
+    "<PI2X_ROOT>/browser-profile",
+    "<PI2X_ROOT>/workspace",
+    "<PI2X_ROOT>/agent-dir",
+    "<PI2X_ROOT>/tmp",
     "/root",
   ];
   for (const p of forbidden) {

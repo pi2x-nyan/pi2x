@@ -5,9 +5,9 @@
 #   2) 杀掉卡住的 bridge 重连循环，用 restart-pi2x.sh 重新拉起
 #   3) 通知 admin
 LOG=/var/log/pi2x-napcat-watchdog.log
-STATE=/opt/pi2x/.napcat-offline-count
-ADMIN="$(node -e 'try{const c=JSON.parse(require("fs").readFileSync("/opt/pi2x/whitelist.json","utf8"));console.log(Object.entries(c.users||{}).find(([,v])=>v==="admin")?.[0]||"")}catch(e){}' 2>/dev/null)"
-ROOT=/opt/pi2x
+STATE=<PI2X_ROOT>/.napcat-offline-count
+ADMIN="$(node -e 'try{const c=JSON.parse(require("fs").readFileSync("<PI2X_ROOT>/whitelist.json","utf8"));console.log(Object.entries(c.users||{}).find(([,v])=>v==="admin")?.[0]||"")}catch(e){}' 2>/dev/null)"
+ROOT=<PI2X_ROOT>
 
 cd "$ROOT" || exit 0
 ST=$(timeout 25 node scripts/napcat-status.mjs 2>/dev/null | tail -1)

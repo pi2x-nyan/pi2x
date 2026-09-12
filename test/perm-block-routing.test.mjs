@@ -23,6 +23,13 @@ import path from "node:path";
 const ROOT = path.resolve(import.meta.dirname, "..");
 const PIAGENT = fs.readFileSync(path.join(ROOT, "lib/piagent.mjs"), "utf8");
 
+// 测试不该写死真实 QQ 号（会进公开仓库）。这里从白名单按**角色**推导，
+// 既避免泄露号码，也让用例在换号后依然成立。
+const WL = JSON.parse(fs.readFileSync(path.join(ROOT, "whitelist.json"), "utf8"));
+const userOf = (preset) => Object.entries(WL.users ?? {}).find(([, v]) => v === preset)?.[0] ?? "";
+const ADMIN_QQ = userOf("admin");
+const OPERATOR_QQ = userOf("operator");
+
 /** 造一个只带 white 存根的 PiAgent（避免真初始化子系统的开销） */
 async function makeAgent(preset) {
   const tmpMod = path.join(ROOT, "lib", "__piagent_perm_test.mjs");
@@ -46,15 +53,15 @@ async function makeAgent(preset) {
 test("私聊 + admin：不显示权限白名单", async () => {
   const { agent, cleanup } = await makeAgent("admin");
   try {
-    assert.equal(agent._permBlock("3573297011", { chatType: "private" }), "", "admin 私聊仍生成了白名单");
-    assert.equal(agent._permBlock("3573297011"), "", "默认（私聊）也应不显示");
+    assert.equal(agent._permBlock(ADMIN_QQ, { chatType: "private" }), "", "admin 私聊仍生成了白名单");
+    assert.equal(agent._permBlock(ADMIN_QQ), "", "默认（私聊）也应不显示");
   } finally { cleanup(); }
 });
 
 test("私聊 + 非 admin：生成白名单（将并入 system prompt）", async () => {
   const { agent, cleanup } = await makeAgent("operator");
   try {
-    const t = agent._permBlock("1570515219", { chatType: "private" });
+    const t = agent._permBlock(OPERATOR_QQ, { chatType: "private" });
     assert.ok(t.length > 0, "非 admin 私聊应生成白名单");
     assert.match(t, /【权限组白名单】/);
     assert.match(t, /当前权限组：operator/);
@@ -65,7 +72,7 @@ test("私聊 + 非 admin：生成白名单（将并入 system prompt）", async 
 test("群聊：admin 也照常显示白名单（保持原状况）", async () => {
   const { agent, cleanup } = await makeAgent("admin");
   try {
-    const t = agent._permBlock("3573297011", { chatType: "group" });
+    const t = agent._permBlock(ADMIN_QQ, { chatType: "group" });
     assert.ok(t.length > 0, "群聊下 admin 的白名单也被跳过了 —— 改动范围超出了私聊");
     assert.match(t, /【权限组白名单】/);
     assert.match(t, /当前权限组：admin/);

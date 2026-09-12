@@ -3,7 +3,7 @@
  * PI2X 看门狗（watchdog）—— 住在 bridge 外面，负责探活与降级
  *
  * 【运行方式】由 cron 每分钟调用一次：
- *     * * * * * cd /opt/pi2x && /usr/bin/node scripts/watchdog.mjs >> logs/watchdog.log 2>&1
+ *     * * * * * cd <PI2X_ROOT> && /usr/bin/node scripts/watchdog.mjs >> logs/watchdog.log 2>&1
  *
  * 为什么用 cron 而不是常驻进程：
  *   常驻进程自己也会坏、需要被监控，会引入递归问题。cron 由系统托管，与本项目完全解耦，

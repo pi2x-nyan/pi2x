@@ -13,14 +13,14 @@
 #
 # 用法：
 #   bash scripts/session-rescue.sh <会话名> [提示QQ]
-#     <会话名>  如 private_3573297011（sessions/ 下的文件名，不含 .jsonl）
+#     <会话名>  如 private_<QQ>（sessions/ 下的文件名，不含 .jsonl）
 #     [提示QQ]  完成后给它发一条通知（可选）
 #
 # 例：
-#   bash scripts/session-rescue.sh private_3573297011 3573297011
+#   bash scripts/session-rescue.sh private_<QQ> <QQ>
 set -uo pipefail
 
-ROOT_DIR="/opt/pi2x"
+ROOT_DIR="<PI2X_ROOT>"
 cd "$ROOT_DIR" || exit 1
 export PATH=/usr/local/bin:/usr/bin:/bin
 

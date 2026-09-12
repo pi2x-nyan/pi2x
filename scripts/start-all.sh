@@ -36,7 +36,7 @@ if curl -s -m 5 -o /dev/null http://127.0.0.1:20228/v1/models 2>/dev/null; then
   say "cc-go 代理已就绪"
 else
   say "启动 cc-go 代理..."
-  bash /opt/pi2x/scripts/cc-go-start.sh >> "$LOG" 2>&1
+  bash <PI2X_ROOT>/scripts/cc-go-start.sh >> "$LOG" 2>&1
 fi
 
 # 3) OmniRoute（:20128）—— 关键：原先无任何自启入口
@@ -44,7 +44,7 @@ if curl -s -m 5 -o /dev/null http://127.0.0.1:20128/v1/models 2>/dev/null; then
   say "OmniRoute 已就绪"
 else
   say "启动 OmniRoute..."
-  bash /opt/pi2x/scripts/omniroute-restart.sh >> "$LOG" 2>&1
+  bash <PI2X_ROOT>/scripts/omniroute-restart.sh >> "$LOG" 2>&1
 fi
 
 # 4) bridge（pi agent）
@@ -52,7 +52,7 @@ if pgrep -f "[b]ridge.mjs" >/dev/null 2>&1; then
   say "bridge 已在运行"
 else
   say "启动 bridge..."
-  bash /opt/pi2x/scripts/restart-pi2x.sh >> "$LOG" 2>&1 &
+  bash <PI2X_ROOT>/scripts/restart-pi2x.sh >> "$LOG" 2>&1 &
 fi
 
 say "start-all 完成：NapCat=$(pgrep -cf '[o]pt/QQ/qq' 2>/dev/null || echo 0) ccgo=$(curl -s -m 4 -o /dev/null -w '%{http_code}' http://127.0.0.1:20228/v1/models 2>/dev/null) omni=$(curl -s -m 4 -o /dev/null -w '%{http_code}' http://127.0.0.1:20128/v1/models 2>/dev/null) bridge=$(pgrep -f '[b]ridge.mjs' | head -1)"

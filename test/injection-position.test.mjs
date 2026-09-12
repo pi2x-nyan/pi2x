@@ -80,8 +80,21 @@ test("不再用 context 事件注入（它的改写会落盘）", () => {
 });
 
 test("临时块注入位于 before_provider_request 钩子里", () => {
-  const m = SRC.match(/pi\.on\(\s*["']before_provider_request["'][\s\S]{0,900}?appendTailBlock/);
+  // 窗口放宽到 2000 字符：注入段前后有大量解释性注释（那些注释是必要的，
+  // 记录了「为什么不能用 system prompt」「为什么不用 context 事件」的实测依据）。
+  const m = SRC.match(/pi\.on\(\s*["']before_provider_request["'][\s\S]{0,2600}?appendTailBlock/);
   assert.ok(m, "没找到 before_provider_request 中调用 appendTailBlock");
+});
+
+test("记忆只在用户轮注入，工具轮不重复塞（省 token + 少动缓存尾部）", () => {
+  const i = SRC.indexOf('pi.on("before_provider_request"');
+  assert.ok(i > 0);
+  const seg = SRC.slice(i, i + 2600);
+  // 必须显式判断报文最后一条的角色
+  assert.match(seg, /lastRole\s*=\s*payloadMsgs\[payloadMsgs\.length - 1\]\?\.role/, "没找到「最后一条角色」的判定");
+  assert.match(seg, /isUserTurn\s*=\s*lastRole === "user"/, "没找到「是否用户轮」的判定");
+  // 记忆必须受 isUserTurn 约束；权限尾块与风险研判不受约束（它们本就每请求有效）
+  assert.match(seg, /isUserTurn \? tc\.memInjection : ""/, "记忆注入未被 isUserTurn 门控");
 });
 
 test("before_agent_start 的注入必须都是「同一会话内稳定」的内容", () => {
@@ -107,6 +120,15 @@ test("before_agent_start 的注入必须都是「同一会话内稳定」的内�
 
   assert.match(seg, /persona/, "人设应仍在 system 中注入");
   assert.match(seg, /permBlockSys/, "私聊权限白名单应并入 system（权限稳定，不破坏缓存）");
+});
+
+test("search_memories 的描述说明「工具轮需自行检索」（与注入策略一致）", () => {
+  // 记忆只在用户轮注入 → 工具轮里模型必须知道可以自己搜，否则会凭印象编造。
+  // 这条把「注入策略」与「工具描述」的一致性锁住：改了一边必须同步另一边。
+  const f = path.join(ROOT, "prompt/tools/search_memories.md");
+  const t = fs.readFileSync(f, "utf8");
+  assert.match(t, /自行检索|自己搜|工具轮不重复注入/, "工具描述没说明工具轮需自行检索");
+  assert.doesNotMatch(t, /已自动注入【记忆】块[\s\S]{0,40}不必再搜索/, "描述仍按「每轮都注入」的旧假设写");
 });
 
 test("会话文件里不写权限白名单 / 记忆块 / 风险研判", () => {

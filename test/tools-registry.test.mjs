@@ -32,7 +32,7 @@ function fakeMe() {
     white: { perms: () => new Set(), presetOf: () => "admin" },
     sessions: new Map(),
     bridge: null,
-    _sessionCwd: () => "/opt/pi2x/workspace",
+    _sessionCwd: () => "<PI2X_ROOT>/workspace",
   };
 }
 

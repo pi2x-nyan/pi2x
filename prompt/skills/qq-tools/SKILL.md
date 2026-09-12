@@ -1,6 +1,6 @@
 ---
 name: qq-tools
-description: QQ 能力手册。核心对话工具（qq_send_message/qq_send_file）始终可用；查询/管理类非核心能力不注入工具清单，经 /opt/pi2x/scripts/qq-cli.mjs 渐进披露（group_history/msg_detail/friend_list/group_list/ocr/group_file_url/download/delete_msg/napcat/op/deop），需要时先读本 skill 再按需调用（--as 当前用户QQ）。
+description: QQ 能力手册。核心对话工具（qq_send_message/qq_send_file）始终可用；查询/管理类非核心能力不注入工具清单，经 <PI2X_ROOT>/scripts/qq-cli.mjs 渐进披露（group_history/msg_detail/friend_list/group_list/ocr/group_file_url/download/delete_msg/napcat/op/deop），需要时先读本 skill 再按需调用（--as 当前用户QQ）。
 ---
 # qq-tools —— QQ 能力（渐进披露）
 
@@ -13,7 +13,7 @@ description: QQ 能力手册。核心对话工具（qq_send_message/qq_send_file
 ## 按需调用（bash + CLI，渐进披露）
 需要以下能力时，**先确认当前对话者身份（决定 `--as` 与权限）**，再执行：
 ```bash
-Q="node /opt/pi2x/scripts/qq-cli.mjs --as <当前用户QQ>"
+Q="node <PI2X_ROOT>/scripts/qq-cli.mjs --as <当前用户QQ>"
 $Q group_history <群号> [条数]        # 群最近聊天记录
 $Q msg_detail <消息id>                 # 单条消息详情
 $Q friend_list / group_list           # 好友/群列表
