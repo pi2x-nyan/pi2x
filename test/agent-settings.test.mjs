@@ -7,7 +7,12 @@
  * pi 判定「摘要不完整」并**静默放弃整次压缩** —— 外部表现是「压缩没反应、上下文不变」，
  * 且同规模输入一次成功一次失败（随机性），极难定位。
  *
- * 本测试锁死：摘要预算必须**显著大于** pi 默认值，且设置必须真的传递进 SettingsManager。
+ * 本测试锁死：摘要预算必须**大于** pi 默认值（否则截断），且设置必须真的传递进 SettingsManager。
+ *
+ * 注意当前预算（40983 ⇒ 摘要上限 32786）是**用户指定**的，不等于「越大越好」。
+ * 断言写成「高于触发事故的下限」，而非绑定某个具体大数：
+ *   · 必须 > pi 默认 16384（否则摘要上限只有 13107，注定截断）；
+ *   · 摘要上限必须高于实测真实用量（42 万 token 历史 → 摘要约 7.1K token）。
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -16,20 +21,22 @@ import { makeSettingsManager, SUMMARIZATION_RESERVE_TOKENS, KEEP_RECENT_TOKENS }
 /** pi 的默认 reserveTokens —— 低于此预算会触发上面的截断事故 */
 const PI_DEFAULT_RESERVE_TOKENS = 16384;
 
-test("makeSettingsManager：reserveTokens 必须显著高于 pi 默认值（防摘要被截断）", () => {
+test("makeSettingsManager：reserveTokens 必须高于 pi 默认值（防摘要被截断）", () => {
   const s = makeSettingsManager().getCompactionSettings();
   assert.equal(s.reserveTokens, SUMMARIZATION_RESERVE_TOKENS);
   assert.ok(
-    s.reserveTokens >= PI_DEFAULT_RESERVE_TOKENS * 2,
-    `摘要预算太小：${s.reserveTokens}，至少应为 pi 默认（${PI_DEFAULT_RESERVE_TOKENS}）的 2 倍`,
+    s.reserveTokens > PI_DEFAULT_RESERVE_TOKENS,
+    `摘要预算 ${s.reserveTokens} 不得低于 pi 默认（${PI_DEFAULT_RESERVE_TOKENS}），否则摘要上限仅 13107 必被截断`,
   );
 });
 
-test("makeSettingsManager：摘要输出上限（0.8×reserveTokens）足够容纳长历史摘要", () => {
+test("makeSettingsManager：摘要输出上限（0.8×reserveTokens）符合约定且高于实测所需", () => {
   const s = makeSettingsManager().getCompactionSettings();
   const summaryBudget = Math.floor(0.8 * s.reserveTokens);
-  // 实测一次成功摘要约 2.5 万字符；按最保守的 1 字符≈1 token 估算也需 >20k
-  assert.ok(summaryBudget > 30000, `摘要输出上限仅 ${summaryBudget} token，仍可能被截断`);
+  // 用户指定：摘要上限恰为 32786
+  assert.equal(summaryBudget, 32786, `摘要上限应为 32786，实际 ${summaryBudget}`);
+  // 实测摘要真实用量约 7.1K token（42.4 万 token 历史 / 24.9K 字符），必须留足余量
+  assert.ok(summaryBudget > 10000, `摘要上限 ${summaryBudget} 低于实测所需，可能被截断`);
 });
 
 test("makeSettingsManager：keepRecentTokens 被显式设置且为有限正数", () => {

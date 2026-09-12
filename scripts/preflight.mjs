@@ -102,7 +102,80 @@ function criticalModules() {
   return files.filter((f) => fs.existsSync(path.join(ROOT, f)));
 }
 
+/**
+ * pi 扩展的 peer 依赖自愈。
+ *
+ * 【为什么需要】pi 的扩展（如 pi-web-access）把 @earendil-works/* 声明为
+ * peerDependencies，但 pi 自己的包管理器（package-manager.js）**不安装 peer**，
+ * 而 pi 用 jiti + alias 加载扩展 —— alias 只覆盖静态 import；扩展里凡是用
+ * 动态 `import("./extract.ts")` 懒加载的模块，会绕过 alias 回退到 Node 原生解析，
+ * 于是在扩展目录下找不到 peer 就抛 "Cannot find module '@earendil-works/pi-coding-agent'"。
+ *
+ * 症状特别隐蔽：pi 能正常启动、扩展也能装上，只有调用到那条懒加载路径（例如
+ * fetch_content 读网页）时才报错 —— 表现为「个别工具莫名其妙不可用」。
+ *
+ * 修法：在扩展的 node_modules 下把三个 peer 软链到 pi 自带的包。
+ * 必须幂等 + 自动（重装扩展会清掉软链），所以放在冒烟检查里每次跑。
+ *
+ * 返回 ok 恒为 true（软链失败不应该拦住重启 —— 只是少个工具，不是致命故障），
+ * 但会打印实际结果，便于发现。
+ */
+function healExtensionPeers() {
+  const nmRoot = "/root/.pi/agent/npm/node_modules";
+  const peers = [
+    ["@earendil-works/pi-coding-agent", `${ROOT}/node_modules/@earendil-works/pi-coding-agent`],
+    [
+      "@earendil-works/pi-ai",
+      `${ROOT}/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai`,
+    ],
+    [
+      "@earendil-works/pi-tui",
+      `${ROOT}/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui`,
+    ],
+  ];
+  // 没有装扩展就没什么可修的
+  if (!fs.existsSync(nmRoot)) return { ok: true, detail: "无扩展目录，跳过" };
+  const linkRoot = path.join(nmRoot, "@earendil-works");
+  const fixed = [];
+  const missing = [];
+  for (const [name, target] of peers) {
+    const short = name.split("/").pop();
+    const link = path.join(linkRoot, short);
+    if (!fs.existsSync(target)) {
+      missing.push(`${short}(源不存在)`);
+      continue;
+    }
+    try {
+      const st = fs.lstatSync(link);
+      if (st.isSymbolicLink()) {
+        // 已存在且指向正确 → 无需处理
+        const cur = fs.readlinkSync(link);
+        if (cur === target) continue;
+        fs.unlinkSync(link);
+      } else {
+        continue; // 是真实目录（npm 装好了），别动
+      }
+    } catch {
+      // 不存在 → 下面创建
+    }
+    try {
+      fs.mkdirSync(linkRoot, { recursive: true });
+      fs.symlinkSync(target, link);
+      fixed.push(short);
+    } catch (e) {
+      missing.push(`${short}(${e?.message})`);
+    }
+  }
+  const parts = [];
+  if (fixed.length) parts.push(`已补链: ${fixed.join(", ")}`);
+  if (missing.length) parts.push(`跳过: ${missing.join(", ")}`);
+  return { ok: true, detail: parts.join(" · ") || "peer 依赖完整" };
+}
+
 console.log(`── PI2X 冒烟检查 ${FAST ? "（fast 模式，跳过测试）" : ""}──`);
+
+// 0) pi 扩展 peer 依赖自愈（必须在加载扩展之前做）
+step("pi 扩展 peer 依赖自愈", healExtensionPeers);
 
 // 1) 语法
 step("语法检查（node --check 全部运行时链路文件）", () => {

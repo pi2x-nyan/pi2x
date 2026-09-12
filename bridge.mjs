@@ -225,6 +225,19 @@ logBoot.info("pi agent 就绪，PI2X 开始工作");
   logBoot.info(`心跳已启动（每 ${Math.round(intervalMs / 1000)} 秒）`);
 }
 
+// ---------- 4.6 闲置压缩巡检 ----------
+// 为什么不能用「轮次结束时检查」代替：上下文停在 30%（低于 40% 阈值）后若一直没人
+// 说话，就没有任何轮次结束，检查逻辑永远不执行 —— 下次开口时又带着陈旧上下文请求。
+// 闲置期正是压缩的最佳时机（没人在等回复）。
+// 注意：工具执行跑很久属于**忙碌**，巡检里会跳过（见 _startIdleCompact 的注释）。
+try {
+  // 变量名是 pi（createPiAgent 的返回值），别写成 agent —— 我第一版就写错了，
+  // 结果启动日志里只有一句 warn「agent is not defined」，巡检静默没起来。
+  pi._startIdleCompact?.();
+} catch (e) {
+  logBoot.warn(`闲置压缩启动失败: ${e?.message}`);
+}
+
 // ---------- 5. 消息路由 ----------
 const perm = config.permissions ?? {};
 const allowedUsers = (perm.allowedUsers ?? []).map(String);
