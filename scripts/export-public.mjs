@@ -105,9 +105,19 @@ function main() {
     process.exit(1);
   }
 
-  // ── 1) 复制 + 剥离 + 改写 ────────────────────────────────────────────
-  if (fs.existsSync(OUT)) fs.rmSync(OUT, { recursive: true, force: true });
+  // ── 1) 同步文件到导出目录（**保留 .git，累积提交历史**）──────────────
+  //
+  // 【为什么不再 rm -rf 重建】
+  // 原实现每次删除整个导出目录、重新 git init，于是每份产物都只有一条 commit；
+  // 推到远程再强推覆盖，远程永远只有一条历史，看不出演进过程。
+  // 现在只清理「非 .git 的内容」，仓库本体留着，改动累积成新 commit。
+  // 配套：推送改为普通 push（见文末提示），这样远程会正常累积历史。
   fs.mkdirSync(OUT, { recursive: true });
+  // 清掉上次的产物文件（保留 .git），避免已删除文件残留在工作区
+  for (const e of fs.readdirSync(OUT)) {
+    if (e === ".git") continue;
+    fs.rmSync(path.join(OUT, e), { recursive: true, force: true });
+  }
 
   const files = trackedFiles();
   let copied = 0;
@@ -134,32 +144,46 @@ function main() {
     if (excluded.length > 12) console.log(`          … 另有 ${excluded.length - 12} 个`);
   }
 
-  // ── 2) git init（先建仓库，扫描器才能按 git ls-files 精确统计）────────
+  // ── 2) git 提交（仓库若不存在才 init；有变化才新增 commit）──────────
   if (!NO_GIT) {
     try {
-      execFileSync("git", ["init", "-q"], { cwd: OUT });
+      if (!fs.existsSync(path.join(OUT, ".git"))) {
+        execFileSync("git", ["init", "-q"], { cwd: OUT });
+        // 默认分支统一为 main，避免 master/main 两套命名
+        try { execFileSync("git", ["symbolic-ref", "HEAD", "refs/heads/main"], { cwd: OUT }); } catch { /* 老版本 git 无妨 */ }
+        console.log("        导出目录首次创建：已 git init");
+      }
       execFileSync("git", ["add", "-A"], { cwd: OUT });
-      execFileSync(
-        "git",
-        [
-          "-c",
-          "user.email=pi2x@localhost",
-          "-c",
-          "user.name=PI2X",
-          "commit",
-          "-q",
-          "-m",
-          "PI2X：以 pi SDK 为框架的 QQ 智能助手\n\n由本地仓库导出，已剥离密钥、隐私与人设。",
-        ],
-        { cwd: OUT }
-      );
-      const n = execFileSync("git", ["ls-files"], { cwd: OUT, encoding: "utf8" }).split("\n").filter(Boolean).length;
-      console.log(`【2/3】已初始化独立仓库（${n} 个文件，历史仅一条）`);
+
+      // 有暂存改动才提交（否则每次导出都会产生一条空提交，历史会变成噪音）
+      const staged = execFileSync("git", ["diff", "--cached", "--name-only"], { cwd: OUT, encoding: "utf8" }).trim();
+      if (!staged) {
+        const n = execFileSync("git", ["ls-files"], { cwd: OUT, encoding: "utf8" }).split("\n").filter(Boolean).length;
+        console.log(`【2/3】内容无变化，跳过提交（${n} 个文件）`);
+      } else {
+        const files = staged.split("\n").filter(Boolean);
+        const n = execFileSync("git", ["ls-files"], { cwd: OUT, encoding: "utf8" }).split("\n").filter(Boolean).length;
+        // 提交信息带上「来源提交」与改动摘要，远程历史因此可追溯
+        const srcHead = (() => {
+          try { return execFileSync("git", ["-C", ROOT, "log", "-1", "--pretty=%h %s"], { encoding: "utf8" }).trim(); }
+          catch { return ""; }
+        })();
+        const shown = files.slice(0, 8).map((f) => `- ${f}`).join("\n");
+        const more = files.length > 8 ? `\n… 另有 ${files.length - 8} 个文件` : "";
+        const msg = `sync: 从本地仓库导出（${files.length} 个文件变更）\n\n来源提交：${srcHead}\n\n变更文件：\n${shown}${more}`;
+        execFileSync(
+          "git",
+          ["-c", "user.email=pi2x@localhost", "-c", "user.name=PI2X", "commit", "-q", "-m", msg],
+          { cwd: OUT }
+        );
+        const total = execFileSync("git", ["rev-list", "--count", "HEAD"], { cwd: OUT, encoding: "utf8" }).trim();
+        console.log(`【2/3】已提交 ${files.length} 个文件变更（共 ${n} 个文件，历史第 ${total} 条）`);
+      }
     } catch (e) {
-      fail(`git init 失败：${e?.message}`);
+      fail(`git 提交失败：${e?.message}`);
     }
   } else {
-    console.log("【2/3】已跳过 git init（--no-git）");
+    console.log("【2/3】已跳过 git 操作（--no-git）");
   }
 
   // ── 3) 安全扫描 ──────────────────────────────────────────────────────
@@ -184,11 +208,12 @@ function main() {
   }
 
   console.log(`\n✓ 公开版就绪：${OUT}`);
-  console.log(`\n推送方式：`);
+  console.log(`\n推送方式（普通 push 即可，**不要用 --force** —— 那会把远程历史清成一条）：`);
   console.log(`    cd ${OUT}`);
-  console.log(`    git remote add origin <你的公开仓库地址>`);
-  console.log(`    git push -u origin main`);
-  console.log(`\n建议推送前再人工确认一次：git show --stat`);
+  console.log(`    git remote add origin <你的公开仓库地址>   # 首次`);
+  console.log(`    git push origin main`);
+  console.log(`\n注：远程若仍是「每次强推覆盖」的旧历史，首次需 --force 对齐一次，`);
+  console.log(`    之后就都是普通 push 累积了。`);
 }
 
 main();
