@@ -1,0 +1,119 @@
+{
+  "_comment": [
+    "PI2X 配置模板。复制为 config.json 后按需修改；config.json 已被 .gitignore 忽略，不会进仓库。",
+    "所有 <...> 占位符都必须替换成你自己的值，否则对应功能不可用。",
+    "字段默认值定义在 lib/config.mjs 的 DEFAULTS 中，此处只需写你要覆盖的项。"
+  ],
+  "napcat": {
+    "dir": "./napcat",
+    "qqAccount": "<你的 bot QQ 号>",
+    "onebot": {
+      "wsHost": "127.0.0.1",
+      "wsPort": 3001,
+      "token": "<随机字符串，需与 NapCat 侧一致>"
+    },
+    "autoLogin": true
+  },
+  "pi": {
+    "workspace": "./workspace",
+    "agentDir": "./agent-dir",
+    "replyTimeoutMs": 180000,
+    "maxReplyChars": 1500,
+    "model": "<provider>/<model-id>，例如 omniroute/deepseek-flash",
+    "persona": {
+      "default": {
+        "enabled": false,
+        "_comment": "把统一人设提示词放到 prompt/context/ 下，再把 enabled 改为 true。公开仓库不含任何具体人设。",
+        "promptFile": "<人设文件名>.md"
+      }
+    },
+    "streamReplies": true,
+    "submitTimeoutMs": 600000,
+    "streamFlushMin": 80,
+    "streamFlushMax": 500,
+    "streamFlushIdleMs": 2000,
+    "compactPercent": 70,
+    "compactCooldownMs": 60000,
+    "compactWaitMs": 120000,
+    "slowToolMs": 500,
+    "leakMaxRetries": 3,
+    "subagentTimeoutSec": 240
+  },
+  "permissions": {
+    "groupReplyMode": "mention",
+    "nameKeywords": [
+      "pi2x"
+    ]
+  },
+  "memory": {
+    "enabled": true,
+    "dbPath": "./workspace/memories/memory.db",
+    "modelDir": "./workspace/memories/models",
+    "sandboxDir": "./sandbox",
+    "harvestIntervalMin": 10,
+    "maxFacts": 500,
+    "injectChars": 2500,
+    "harvestModel": "<用于记忆提取的模型>",
+    "embedModel": "Xenova/multilingual-e5-small",
+    "embedPrefixQuery": "query: ",
+    "embedPrefixPassage": "passage: ",
+    "scoring": {
+      "center": true,
+      "useCsls": false,
+      "cslsK": 10,
+      "gateSim": 0.2,
+      "mergeSim": 0.56,
+      "relatedSim": 0.4,
+      "recencyDecay": 0.995,
+      "evictMode": "forgetting",
+      "autoSupersede": true,
+      "weights": {
+        "relevance": 3.0,
+        "importance": 2.0,
+        "recency": 0.5,
+        "keyword": 1.5,
+        "pinned": 0.5
+      }
+    },
+    "reflect": {
+      "enabled": true,
+      "hours": 336,
+      "limit": 80,
+      "intervalMin": 720
+    }
+  },
+  "winShell": {
+    "_comment": "跨机执行（可选）。不需要就设 enabled:false。token 泄露等于对方能远程执行命令，务必用长随机串。",
+    "enabled": false,
+    "host": "<跨机组网地址，如 10.0.0.1>",
+    "fallbackHost": "<备用地址，如局域网 IP>",
+    "probeTimeoutMs": 800,
+    "port": 8123,
+    "token": "<长随机字符串>",
+    "timeoutMs": 60000
+  },
+  "lifecycle": {
+    "_comment": "三层降级链（见 REFACTOR-2026-09.md）。safeAdminIds 是安全模式的管理员兜底名单。",
+    "heartbeatIntervalMs": 60000,
+    "heartbeatStaleMs": 180000,
+    "maxNormalAttempts": 3,
+    "maxSafeAttempts": 3,
+    "safeAdminIds": [
+      "<你的 QQ 号>"
+    ]
+  },
+  "tools": {
+    "searchLimitDefault": 10,
+    "searchLimitMax": 30,
+    "resultDefaultChars": 3000,
+    "resultMinChars": 100,
+    "resultMaxChars": 8000,
+    "listAllLimit": 20
+  },
+  "sandboxBash": {
+    "defaultTimeoutSec": 15,
+    "minTimeoutSec": 3,
+    "maxTimeoutSec": 120,
+    "maxOutputChars": 20000
+  }
+}

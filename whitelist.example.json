@@ -1,0 +1,69 @@
+{
+  "groups": {
+    "win": [
+      "tools.windows_shell",
+      "tools.win_file_get",
+      "tools.win_file_put"
+    ],
+    "linux": [
+      "files:full",
+      "tools.qq_send_file",
+      "tools.run_task",
+      "tools.subagent_send",
+      "tools.subagent_result"
+    ],
+    "sandbox": [
+      "files"
+    ],
+    "memory": [
+      "memory.search",
+      "memory.save",
+      "memory.delete",
+      "memory.harvest"
+    ],
+    "info": [
+      "tools.group_history",
+      "tools.get_msg",
+      "tools.friend_list",
+      "tools.group_list",
+      "tools.ocr",
+      "tools.group_file"
+    ],
+    "ops": [
+      "tools.op",
+      "tools.delete_msg",
+      "tools.download",
+      "tools.napcat",
+      "tools.clear_history"
+    ]
+  },
+  "presets": {
+    "dialog": [],
+    "friend": [
+      "memory",
+      "info"
+    ],
+    "operator": [
+      "memory",
+      "sandbox",
+      "info",
+      "ops",
+      "tools.qq_send_file",
+      "tools.run_task",
+      "tools.subagent_send",
+      "tools.subagent_result",
+      "tools.clear_history"
+    ],
+    "admin": [
+      "memory",
+      "linux",
+      "win",
+      "info",
+      "ops"
+    ]
+  },
+  "users": {
+    "<管理员QQ>": "admin",
+    "<普通用户QQ>": "friend"
+  }
+}

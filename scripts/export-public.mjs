@@ -1,0 +1,194 @@
+#!/usr/bin/env node
+/**
+ * 导出公开版 —— 从本地仓库生成可安全发布的快照
+ *
+ * 【为什么需要独立导出，而不是直接 push 本地仓库】
+ * 本地仓库是「完整版」：含本机配置、真人设、运维脚本里的一些部署信息。
+ * 公开仓库需要的是另一份东西 —— 剥离了人设与所有身份/密钥信息的源码快照。
+ * 两者内容不同、目的不同，混在一个仓库里迟早出错（一个手滑 push 就把人设公开了），
+ * 所以物理隔离：本地仓库照常开发，公开版由本脚本生成。
+ *
+ * 【剥什么、为什么】
+ *   prompt/context/2x-*.md   人设提示词 —— 属于作者的创作与私人设定，不随代码公开
+ *   config.json / whitelist.json / .cc-pool.json / win-agent/config.json
+ *                            含密钥与真实 QQ，改由 *.example.json 提供模板
+ *   真实姓名、内网 IP、主机名、真实 QQ   —— 身份与拓扑信息
+ *
+ * 【安全闸门】
+ * 导出（并初始化 git 仓库）后自动跑 scripts/scan-secrets.mjs。
+ * **只要还有高危项就删除导出目录并失败** —— 不会留下「看起来能推其实不干净」的产物。
+ *
+ * 执行顺序（重要）：
+ *   0) 工作区必须干净（否则导出内容与提交不一致）
+ *   1) 复制 + 剥离 + 内容改写
+ *   2) git init（让扫描器能按 git ls-files 精确统计）
+ *   3) 安全扫描 ← 不过关则整目录删除
+ *
+ * 用法：
+ *   node scripts/export-public.mjs                  # 导出到 tmp/public-export/
+ *   node scripts/export-public.mjs --out <目录>     # 指定输出目录
+ *   node scripts/export-public.mjs --no-git         # 不初始化 git 仓库
+ *   node scripts/export-public.mjs --skip-scan      # 跳过扫描（不建议）
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const ARGS = process.argv.slice(2);
+const outIdx = ARGS.indexOf("--out");
+const OUT = path.resolve(outIdx >= 0 ? ARGS[outIdx + 1] : path.join(ROOT, "tmp", "public-export"));
+const NO_GIT = ARGS.includes("--no-git");
+const SKIP_SCAN = ARGS.includes("--skip-scan");
+
+/** 不进入公开版的文件 */
+const EXCLUDE_PATTERNS = [
+  // 人设提示词（作者的私人设定）。
+  // 注意匹配的是 `2x`（不带横线）：统一人设后文件名为 2x.md，
+  // 若仍写成 /^prompt\/context\/2x-/ 就会漏掉它、把私人人设导出到公开仓库。
+  /^prompt\/context\/2x/,
+  // 重构记录 REFACTOR-*.md：含大量本机部署细节、真实路径与排障过程
+  // （包括密钥排查痕迹），按用户要求不上传公开仓库，仅本地保留。
+  /^REFACTOR-.*\.md$/,
+  /^\.private-terms$/,
+  /^tmp\//,
+  /^logs\//,
+  /^state\//,
+  /^sessions\//,
+  /^sandbox\//,
+  /^workspace\//,
+  /^agent-dir\//,
+  /^\.git\//,
+];
+
+/** 内容改写：把身份信息与本地设定换成通用说法 */
+const REWRITES = [
+  { file: /^config\.example\.json$/, from: /"2x"\s*:/g, to: '"default":' },
+  { file: /^lib\/config\.mjs$/, from: /persona\.2x|"2x"/g, to: "persona" },
+  { file: /\.(md|mjs|json|sh|ps1)$/, from: /<创建者>/g, to: "<创建者>" },
+  { file: /\.(md|mjs|json)$/, from: /10\.208\.\d+\.\d+/g, to: "<LAN_IP>" },
+  { file: /\.(md|mjs|json)$/, from: /10\.126\.\d+\.\d+/g, to: "<OVERLAY_IP>" },
+];
+
+const TEXTISH = /\.(mjs|js|json|md|sh|ps1|txt|example|gitignore)$/;
+
+function trackedFiles() {
+  return execFileSync("git", ["-C", ROOT, "ls-files"], { encoding: "utf8" }).split("\n").filter(Boolean);
+}
+
+function shouldExclude(rel) {
+  return EXCLUDE_PATTERNS.some((re) => re.test(rel));
+}
+
+function rewriteContent(rel, text) {
+  let out = text;
+  for (const r of REWRITES) if (r.file.test(rel)) out = out.replace(r.from, r.to);
+  return out;
+}
+
+function fail(msg) {
+  console.error(`\n✗ ${msg}`);
+  if (fs.existsSync(OUT)) {
+    fs.rmSync(OUT, { recursive: true, force: true });
+    console.error(`  已删除导出目录 ${OUT}（避免留下不干净的产物）`);
+  }
+  process.exit(1);
+}
+
+function main() {
+  // ── 0) 工作区必须干净 ────────────────────────────────────────────────
+  const dirty = execFileSync("git", ["-C", ROOT, "status", "--porcelain"], { encoding: "utf8" }).trim();
+  if (dirty) {
+    console.error("✗ 工作区有未提交改动，请先提交（否则导出内容与仓库不一致）：");
+    console.error(dirty.split("\n").slice(0, 10).map((l) => `    ${l}`).join("\n"));
+    process.exit(1);
+  }
+
+  // ── 1) 复制 + 剥离 + 改写 ────────────────────────────────────────────
+  if (fs.existsSync(OUT)) fs.rmSync(OUT, { recursive: true, force: true });
+  fs.mkdirSync(OUT, { recursive: true });
+
+  const files = trackedFiles();
+  let copied = 0;
+  const excluded = [];
+  for (const rel of files) {
+    if (shouldExclude(rel)) {
+      excluded.push(rel);
+      continue;
+    }
+    const src = path.join(ROOT, rel);
+    const dst = path.join(OUT, rel);
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    if (TEXTISH.test(rel) || path.basename(rel).startsWith(".")) {
+      fs.writeFileSync(dst, rewriteContent(rel, fs.readFileSync(src, "utf8")), "utf8");
+    } else {
+      fs.copyFileSync(src, dst);
+    }
+    copied++;
+  }
+  console.log(`【1/3】已导出 ${copied} 个文件 → ${OUT}`);
+  if (excluded.length) {
+    console.log(`        已剥离 ${excluded.length} 个文件：`);
+    for (const e of excluded.slice(0, 12)) console.log(`          - ${e}`);
+    if (excluded.length > 12) console.log(`          … 另有 ${excluded.length - 12} 个`);
+  }
+
+  // ── 2) git init（先建仓库，扫描器才能按 git ls-files 精确统计）────────
+  if (!NO_GIT) {
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: OUT });
+      execFileSync("git", ["add", "-A"], { cwd: OUT });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.email=pi2x@localhost",
+          "-c",
+          "user.name=PI2X",
+          "commit",
+          "-q",
+          "-m",
+          "PI2X：以 pi SDK 为框架的 QQ 智能助手\n\n由本地仓库导出，已剥离密钥、隐私与人设。",
+        ],
+        { cwd: OUT }
+      );
+      const n = execFileSync("git", ["ls-files"], { cwd: OUT, encoding: "utf8" }).split("\n").filter(Boolean).length;
+      console.log(`【2/3】已初始化独立仓库（${n} 个文件，历史仅一条）`);
+    } catch (e) {
+      fail(`git init 失败：${e?.message}`);
+    }
+  } else {
+    console.log("【2/3】已跳过 git init（--no-git）");
+  }
+
+  // ── 3) 安全扫描 ──────────────────────────────────────────────────────
+  if (SKIP_SCAN) {
+    console.log("【3/3】已跳过安全扫描（--skip-scan，强烈建议不要这么用）");
+  } else {
+    const scan = spawnSync(process.execPath, [path.join(ROOT, "scripts", "scan-secrets.mjs")], {
+      encoding: "utf8",
+      env: { ...process.env, PI2X_SCAN_ROOT: OUT, FORCE_COLOR: "0" },
+    });
+    const out = `${scan.stdout ?? ""}${scan.stderr ?? ""}`;
+    const summary = out.split("\n").filter((l) => /高危|中危|提示/.test(l)).join("\n");
+    console.log("【3/3】安全扫描结果：");
+    console.log(summary.split("\n").map((l) => `        ${l}`).join("\n"));
+
+    const m = /高危\s+(\d+)/.exec(out);
+    const high = m ? Number(m[1]) : -1;
+    if (high !== 0) {
+      console.error("\n" + out);
+      fail("导出目录里仍存在高危项，已中止");
+    }
+  }
+
+  console.log(`\n✓ 公开版就绪：${OUT}`);
+  console.log(`\n推送方式：`);
+  console.log(`    cd ${OUT}`);
+  console.log(`    git remote add origin <你的公开仓库地址>`);
+  console.log(`    git push -u origin main`);
+  console.log(`\n建议推送前再人工确认一次：git show --stat`);
+}
+
+main();

@@ -1,0 +1,6 @@
+{
+  "_comment": "win-agent 配置模板。复制为 config.json；token 泄露等于对方能远程执行命令，请用长随机串。",
+  "port": 8123,
+  "token": "<长随机字符串，与 Linux 侧 config.json 的 winShell.token 一致>",
+  "host": "0.0.0.0"
+}

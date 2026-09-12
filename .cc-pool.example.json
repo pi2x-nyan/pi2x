@@ -1,0 +1,9 @@
+{
+  "_comment": "Command Code 账号池模板。复制为 .cc-pool.json（已 gitignore）。key 形如 user_<...>。",
+  "accounts": [
+    {
+      "name": "<账号别名>",
+      "key": "<user_开头的密钥>"
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────────────
+# 本地私密文件 —— 绝不入库
+# 这些都是「本机部署相关」或「含密钥」，公开仓库只放 examples/ 里的模板
+# ─────────────────────────────────────────────────────────────────────
+config.json
+whitelist.json
+.cc-pool.json
+.private-terms
+.napcat-offline-count
+omniroute.json
+
+# 子组件配置（含 token）
+win-agent/config.json
+win-agent/*.token
+napcat/napcat/config/*.json
+napcat/config/*.json
+
+# 密钥/凭据类（任何形态）
+*.key
+*.pem
+*.p12
+*.token
+cred*.sh
+.env
+.env.*
+*.secret
+
+# ─────────────────────────────────────────────────────────────────────
+# 运行期产物（体积大或含聊天内容）
+# ─────────────────────────────────────────────────────────────────────
+node_modules/
+tmp/
+logs/
+state/
+sessions/
+workspace/
+sandbox/
+agent-dir/
+
+# 浏览器 profile（含登录态 cookie）
+browser-profile/
+browser-profile-op/
+
+# 依赖与构建
+.npm/
+*.log
+
+# ─────────────────────────────────────────────────────────────────────
+# 临时/调试残留
+# ─────────────────────────────────────────────────────────────────────
+review-*.jsonl
+_t_*.mjs
+*.bak
+*.tar.gz
