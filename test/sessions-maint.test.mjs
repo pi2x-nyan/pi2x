@@ -323,3 +323,40 @@ test("正常空闲超过阈值 → 不跳过", () => {
   assert.equal(r.skipped, undefined);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ── 分支点必须沿 leaf 链找（2026-09-13 真实事故）────────────────────────
+
+test("分支点必须取 leaf 链上的 compaction，不能取文件里最后一条（孤儿压缩会误导）", () => {
+  // 【事故】会话里有 7 条 compaction，最后一条（id=orphan）是中途放弃的悬空分支：
+  // 它不在 leaf 回溯链上，也没有任何条目以它为 parent。
+  // 旧逻辑按文件顺序取「最后一条」→ 起点晚了 438 条 → 瘦身把 pi 本来看得见的
+  // 632 条上下文砍成 276 条，悄悄丢掉真实历史。
+  // 正确做法：沿 leaf 的 parentId 回溯，只认链上的 compaction。
+  const lines = [];
+  lines.push(JSON.stringify({ type: "session", id: "s0", version: 1 }));
+  // 一条已完成的压缩（链上）
+  lines.push(JSON.stringify({ type: "message", id: "a1", parentId: "s0", message: { role: "user", content: "旧" } }));
+  lines.push(
+    JSON.stringify({ type: "compaction", id: "c1", parentId: "a1", firstKeptEntryId: "b1", summary: "旧摘要" }),
+  );
+  lines.push(JSON.stringify({ type: "message", id: "b1", parentId: "c1", message: { role: "user", content: "保留我" } }));
+  // 孤儿压缩：挂在一条**不在任何链上**的节点后面，且没有任何后继指向它
+  lines.push(JSON.stringify({ type: "message", id: "x1", parentId: "a1", message: { role: "user", content: "旁支" } }));
+  lines.push(
+    JSON.stringify({ type: "compaction", id: "orphan", parentId: "x1", firstKeptEntryId: "z9", summary: "放弃的压缩" }),
+  );
+  // 真正的主链继续往后
+  lines.push(JSON.stringify({ type: "message", id: "b2", parentId: "b1", message: { role: "assistant", content: "hi" } }));
+
+  const plan = planSlim(lines.join("\n") + "\n");
+  assert.equal(plan.compactionIdx, 2, `应取链上的 c1（行 2），实际取了行 ${plan.compactionIdx}`);
+  const kept = plan.keepLines.join("\n");
+  assert.ok(kept.includes("保留我"), "链上压缩之后的内容必须保留");
+  assert.ok(kept.includes("hi"), "最新内容必须保留");
+  assert.ok(kept.includes("旧摘要"), "链上的压缩条目应保留（作为上下文起点）");
+  // 注：孤儿条目排在保留区间之后，物理上会被留下 —— 这无害（pi 只沿链回溯，
+  // 非链条目它根本不看），只是少省一点体积。真正重要的是**分支点取对了**，
+  // 否则起点后移会把 pi 本来看得见的历史整段砍掉。
+  assert.notEqual(plan.compactionIdx, 5, "绝不能把孤儿压缩当成分支点");
+  assert.equal(plan.firstKeptIdx, 3, "保留起点应是链上压缩的 firstKeptEntryId（b1）");
+});

@@ -195,6 +195,20 @@ if (!readyFinal) {
 }
 logBoot.info("OneBot WS 已就绪");
 
+// ---------- 2.5 /dev 设备节点自愈 ----------
+// 本机是 Android chroot，/dev 是普通空目录（非 devtmpfs）。若 /dev/urandom 不存在，
+// 后续一切需要随机字节的操作都会失败（git 建临时文件、Node 取熵）。
+// 这里在业务开始前补一遍，并写日志 —— 否则这个隐患只会在某个无关操作里以
+// “unable to get random bytes”这种难懂的方式暴露出来。
+try {
+  const { healDevNodes } = await import("./lib/devnodes.mjs");
+  const r = healDevNodes();
+  if (!r.ok) logBoot.warn(`/dev 自愈未完全成功：${r.reason}`);
+  else if (r.changed) logBoot.info(`/dev 设备节点已修复（${r.changed.join(", ")}）`);
+} catch (e) {
+  logBoot.warn(`/dev 自愈异常（不影响启动）：${e?.message}`);
+}
+
 // ---------- 3. 连接 QQ ----------
 const nb = config.napcat.onebot;
 const bridge = new QQBridge({ host: nb.wsHost, port: nb.wsPort, token: nb.token });
@@ -410,6 +424,13 @@ bridge.on("event", async (ev) => {
   // 引用全文增强：reply 段带 id → get_msg 拉被引用消息全文（失败则保留段内自带预览）
   // 注：extractText 产出的标记是 [引用…]（NapCat reply 段只给 id，不含文本，必须 get_msg 拉全文）
   let rawText = rawText0;
+  // 顶层 message 里直接带 forward 段 → 这条消息本身就是一张聊天记录卡片（直接发的）；
+  // 若 [转发 id:...] 只出现在引用块里（rawText 有 [引用 且顶层无 forward 段），
+  // 则属于「引用了一条转发」，那种情况才展开。
+  const directForward =
+    message_type === "group" &&
+    Array.isArray(message) &&
+    message.some((s) => s.type === "forward");
   if (rawText0.includes("[引用")) {
     try {
       const replySeg = (Array.isArray(message) ? message : []).find((s) => s.type === "reply");
@@ -441,7 +462,21 @@ bridge.on("event", async (ev) => {
   // 合并转发的 extractText 产出是 `[转发 id:xxx]`（非空），所以不会被下面那道空文本闸拦掉；
   // 但若渲染失败，我们会把它降级成一个说明性占位符，避免模型看到 id 却无从理解。
   if (rawText.includes("[转发")) {
-    rawText = await expandForward(bridge, message, rawText);
+    // 【群聊里不自动展开聊天记录】按用户要求：群里别人直接发的合并转发（聊天记录卡片）
+    // **不喂给模型** —— 那本质上是把一群人的对话整段灌进上下文，既噪又牵涉他人隐私，
+    // 而且发送者未必是想让 bot 读它。
+    // 只有用户**主动引用**（回复）某条转发时才展开：那是明确的「请你看看这个」。
+    // 私聊不受此限 —— 私聊里转发给 bot 本身就是明确意图。
+    if (directForward) {
+      // 降级成说明性占位符而不是直接删掉：让模型知道「这里有一条转发、我没读」，
+      // 才不会以为消息是空的，也不会凭空编造内容。
+      rawText = rawText.replace(
+        /\[转发[^\]]*\]/,
+        "〔转发消息（群聊默认不展开；如需我看，请引用该条转发）〕",
+      );
+    } else {
+      rawText = await expandForward(bridge, message, rawText);
+    }
   }
   if (!rawText) return;
 
@@ -476,7 +511,12 @@ bridge.on("event", async (ev) => {
     if (busy) {
       text = "\n（注：对方又空@了你一次，未带文字——请先处理上面那条已收到的内容；如果上面那条已经没什么可做的，就问一句 TA 想聊什么。）";
     } else {
-      // 群聊空@：自动拉取该群最近聊天记录喂给模型，让它基于真实历史推断，而不是猜
+      // 群聊空@：拉取该群最近聊天记录作为上下文，让模型基于真实历史推断，而不是猜。
+      //
+      // 【为什么这里与「转发卡片」的处理不同】两者容易混淆，区别在**意图归属**：
+      //   · 空@ 是**明确 @ 了 bot**，属于被请求 → 拉本群自己的近期上下文是合理的；
+      //   · 群里别人随手转发的聊天记录卡片并没有指向 bot，且内容可能来自别处
+      //     （含他人对话），所以不整段灌进模型，只在被引用时才展开（见 expandForward 调用处）。
       let groupCtx = "";
       if (message_type === "group") {
         groupCtx = await fetchRecentGroupCtx(group_id, self_id);

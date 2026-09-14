@@ -82,3 +82,38 @@ test("主入口 bridge.mjs 从 lib/config.mjs 取配置，不自己 JSON.parse �
   assert.doesNotMatch(s, /JSON\.parse\(fs\.readFileSync\(path\.join\(ROOT, "config\.json"\)/, "应改用 lib/config.mjs 的 config");
   assert.match(s, /from "\.\/lib\/config\.mjs"/);
 });
+
+test("不得把裸 console 当作默认 logger（会让日志丢掉时间戳）", () => {
+  const offenders = [];
+  for (const f of runtimeFiles()) {
+    const rel = path.relative(ROOT, f);
+    if (rel === "lib/log.mjs") continue; // 它自己就是输出终端
+    if (rel === "lib/config.mjs") continue; // 有意直写 stderr（见上一条测试）
+    const lines = fs.readFileSync(f, "utf8").split("\n");
+    lines.forEach((line, i) => {
+      const code = line.replace(/\/\/.*$/, "");
+      // logger = console / logger: console —— 都会绕过 lib/log.mjs
+      if (/\blogger\s*[:=]\s*console\b/.test(code)) {
+        offenders.push(`${rel}:${i + 1}: ${line.trim()}`);
+      }
+    });
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `默认 logger 不能是 console（直写 stdout，日志没有时间戳；请用 createLogger）：\n${offenders.join("\n")}`,
+  );
+});
+
+test("日志时间戳必须带日期（YYYY-MM-DD），否则跨天日志无法区分", () => {
+  const src = fs.readFileSync(path.join(ROOT, "lib", "log.mjs"), "utf8");
+  assert.match(src, /getFullYear\(\)/, "人类可读通道的时间戳必须包含年份");
+  assert.match(src, /getMonth\(\)/, "必须包含月份");
+  assert.match(src, /getDate\(\)/, "必须包含日");
+  // 反向：不应再存在只输出 HH:MM:SS 的旧实现
+  assert.doesNotMatch(
+    src,
+    /function localHms\(\)/,
+    "旧的 localHms（仅时刻）必须已被带日期的 localStamp 取代",
+  );
+});

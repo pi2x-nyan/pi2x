@@ -59,10 +59,43 @@ test("输出包含时间戳、级别、scope", () => {
   const prev = getLevel();
   setLevel("info");
   const out = capture(() => createLogger("myscope").info("hello"));
-  assert.match(out, /^\d{2}:\d{2}:\d{2}\.\d{3} /, "应以本地时间戳开头");
+  assert.match(out, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} /, "应以带日期的本地时间戳开头");
   assert.match(out, /\[info\]/);
   assert.match(out, /\[myscope\]/);
   assert.match(out, /hello/);
+  setLevel(prev);
+});
+
+test("时间戳带日期，且与当前本地日期一致（防止跨天日志歧义）", () => {
+  const prev = getLevel();
+  setLevel("info");
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  const today = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  const out = capture(() => createLogger("t").info("x"));
+  assert.ok(
+    out.startsWith(today),
+    `时间戳应以今天的日期 ${today} 开头，实际: ${out.slice(0, 30)}`
+  );
+  setLevel(prev);
+});
+
+test("console.log 兼容别名：createLogger(...).log() 也带时间戳与 scope", () => {
+  const prev = getLevel();
+  setLevel("info");
+  const out = capture(() => createLogger("asm").log("[dbg-submit] settle"));
+  assert.match(out, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} /, "别名输出也必须有完整时间戳");
+  assert.match(out, /\[asm\]/, "别名输出应带 scope");
+  assert.match(out, /\[dbg-submit\] settle/);
+  setLevel(prev);
+});
+
+test("根记录器 log.log() 同样带时间戳（不依赖 scope）", () => {
+  const prev = getLevel();
+  setLevel("info");
+  const out = capture(() => log.log("裸通道"));
+  assert.match(out, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} /);
+  assert.match(out, /裸通道/);
   setLevel(prev);
 });
 

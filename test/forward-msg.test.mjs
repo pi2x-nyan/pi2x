@@ -163,3 +163,36 @@ test("qqbridge 暴露 getForwardMsg 且走 get_forward_msg", () => {
   const src = fs.readFileSync(path.join(ROOT, "lib/qqbridge.mjs"), "utf8");
   assert.match(src, /getForwardMsg\(forwardId\)\s*\{[\s\S]{0,160}get_forward_msg/);
 });
+
+// ── 群聊限制：直发的转发卡片不喂模型，仅引用时展开 ──────────────────────
+
+test("群聊里别人直接发的合并转发不展开，只给说明性占位符", () => {
+  // 【为什么】群里随手转发的聊天记录卡片并未指向 bot，内容可能来自别处（含他人对话），
+  // 整段灌进模型既噪又牵涉隐私。只有用户主动引用（回复）那条转发，才算明确请求。
+  const i = BRIDGE_SRC.indexOf("if (directForward)");
+  assert.ok(i > 0, "没找到 directForward 分支");
+  const seg = BRIDGE_SRC.slice(i, i + 700);
+  assert.match(seg, /群聊默认不展开|请引用/, "应降级为说明性占位符");
+  assert.doesNotMatch(seg.slice(0, seg.indexOf("} else {")), /expandForward/, "该分支不得调用 expandForward");
+});
+
+test("directForward 的判定是「群聊 + 顶层有 forward 段」", () => {
+  const i = BRIDGE_SRC.indexOf("const directForward =");
+  assert.ok(i > 0, "没找到 directForward 定义");
+  const seg = BRIDGE_SRC.slice(i, i + 300);
+  assert.match(seg, /message_type === "group"/, "必须限定群聊（私聊转发给 bot 是明确意图，应照常展开）");
+  assert.match(seg, /type === "forward"/, "必须检测顶层 forward 段");
+});
+
+test("被引用的转发仍然会展开（只有引用才给模型）", () => {
+  const i = BRIDGE_SRC.indexOf("if (rawText.includes(\"[转发\"))");
+  assert.ok(i > 0, "没找到转发处理入口");
+  const seg = BRIDGE_SRC.slice(i, i + 900);
+  assert.match(seg, /else \{\s*\n\s*rawText = await expandForward/, "非 directForward 时（即被引用）必须展开");
+});
+
+test("不展开时不得静默丢弃（要留说明，避免模型以为消息为空）", () => {
+  const i = BRIDGE_SRC.indexOf("if (directForward)");
+  const seg = BRIDGE_SRC.slice(i, i + 700);
+  assert.match(seg, /〔转发消息/, "必须产出可读占位符");
+});

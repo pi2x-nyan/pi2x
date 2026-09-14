@@ -33,7 +33,7 @@ import { spawnSync } from "node:child_process";
 import { ROOT, LOGS_DIR, STATE_DIR, config } from "../lib/config.mjs";
 import { readMode, writeMode, DEFAULTS } from "../lib/mode.mjs";
 import { decide } from "../lib/mode.mjs";
-import { isAlive, inspect, spawnMode, killMode, waitReady, countLogLines } from "../lib/lifecycle.mjs";
+import { isAlive, inspect, spawnMode, killMode, waitReady, countLogLines, checkRestartLock } from "../lib/lifecycle.mjs";
 import { createLogger } from "../lib/log.mjs";
 
 const log = createLogger("watchdog");
@@ -106,6 +106,18 @@ function tryStartSafe() {
 
 async function main() {
   fs.mkdirSync(LOGS_DIR, { recursive: true });
+
+  // 有人正在重启 → **只跳过本轮**，把判断权交给重启脚本自己（它会验证就绪并回滚）。
+  // 语义细节见 lifecycle.checkRestartLock：同一把锁只跳过第一次，
+  // 第二轮起照常探活 —— 一把残留死锁不该让探活永久失效。
+  const lock = checkRestartLock({
+    stateDir: STATE_DIR,
+    ttlMs: Number(config.lifecycle?.restartLockTtlMs ?? DEFAULTS.restartLockTtlMs),
+  });
+  if (lock.skip) {
+    log.info(`${lock.reason}（lockId=${lock.lockId}）→ 避免与重启脚本抢拉`);
+    return;
+  }
 
   // 用 lifecycle.inspect 统一取状态：它会在读心跳时做「归属校验」，
   // 把「上一个进程的残留心跳」视为没有心跳，避免把刚重启的健康进程误判成卡死。

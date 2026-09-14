@@ -1,8 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 
 import { TurnAssembler, DUP_SIM_THRESHOLD } from "../lib/agent/turn-assembler.mjs";
 import { markSent, resetSent } from "../lib/agent/sent-log.mjs";
+
+// 部分用例需要直接读源码断言接线（行为难以在单测里完整复现）
+const ROOT = path.resolve(import.meta.dirname, "..");
 
 const silent = { log() {}, error() {} };
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -300,4 +305,133 @@ test("结算幂等：prompt 完成后再超时，不会二次结算", async () =
   await new Promise((r) => setTimeout(r, 60)); // 越过超时点
   assert.equal(s.abortCalls, 0, "已正常结算就不该再 abort");
   assert.equal(asm.inflight.size, 0);
+});
+
+// ── 空响应兜底（2026-09-13 真实事故）────────────────────────────────────
+
+test("模型「秒回空」不得静默：必须有兜底文案（用户连发三条没收到任何回复）", async () => {
+  // 【事故经过】上游额度受限，模型连续三次在 2 秒内返回空内容：
+  //   请求成功、无异常、无超时、一个 delta 都没有。
+  //   settle 对空串直接 resolve("")，bridge 收到空串执行 `if (!cleaned) return`，
+  //   于是用户连发三条消息一条回复都没有，也看不到任何错误提示 —— 完全静默。
+  // 超时路径早已有兜底（"这轮处理超时了"），唯独「成功但为空」这条漏了。
+  const src = fs.readFileSync(path.join(ROOT, "lib/agent/turn-assembler.mjs"), "utf8");
+  const i = src.indexOf("空响应兜底");
+  assert.ok(i > 0, "没找到空响应兜底分支");
+  const seg = src.slice(i, i + 600);
+  assert.match(seg, /!err && !out && !toolSent && !streamedOk/, "判定条件必须排除 err/超时/已流式送达");
+  assert.match(seg, /item\.resolve\(/, "必须 resolve 一个非空文案");
+  assert.doesNotMatch(seg, /resolve\(""\)/, "不得再 resolve 空串");
+});
+
+test("err 但 message 为空时也不得静默", () => {
+  const src = fs.readFileSync(path.join(ROOT, "lib/agent/turn-assembler.mjs"), "utf8");
+  const i = src.indexOf("err 但 message 为空时也会静默");
+  assert.ok(i > 0, "没找到 err-message 兜底注释");
+  const seg = src.slice(i, i + 300);
+  assert.match(seg, /未知错误/, "err 无 message 时应给通用文案");
+});
+
+test("兜底顺序：err 优先于超时，超时优先于空响应", () => {
+  const src = fs.readFileSync(path.join(ROOT, "lib/agent/turn-assembler.mjs"), "utf8");
+  const iTimeout = src.indexOf("这轮处理超时了");
+  const iEmpty = src.indexOf("这次模型返回了空内容");
+  const iErr = src.indexOf("err 但 message 为空时也会静默");
+  assert.ok(iTimeout > 0 && iEmpty > 0 && iErr > 0, "三处兜底必须都存在");
+  assert.ok(iTimeout < iEmpty, "超时判定必须在空响应判定之前");
+  assert.ok(iEmpty < iErr, "空响应判定必须在最终 err resolve 之前");
+});
+
+// ── 空闲超时（2026-09-13 真实事故）──────────────────────────────────────
+
+test("超时必须按「空闲」计，不是「总时长」：持续活动不得被掐断", async () => {
+  // 【事故】一轮里模型连续调了 56 次工具（每次 0.4~13 秒，累计约 560 秒），
+  // 全部成功、没有一处卡死，却在第 600 秒被整体掐断 —— 活干完了，一个字没交付。
+  // 根因：定时器从用户消息进来就挂上、中途不重置，「一直在干活」被当成了「卡死」。
+  const s = new FakeSession();
+  const asm = new TurnAssembler(s, { logger: silent });
+  const p = asm.submit("hi", null, { timeoutMs: 120 });
+  await tick();
+  // 每隔 40ms 制造一次活动（模拟持续产出 / 工具执行），总时长会远超 120ms
+  const keepAlive = setInterval(() => s.emit({ type: "tool_execution_start", toolName: "bash" }), 40);
+  await new Promise((r) => setTimeout(r, 400));
+  clearInterval(keepAlive);
+  assert.equal(s.abortCalls, 0, "持续活动期间不该 abort（原来会在 120ms 总时长到点时掐断）");
+  s.stream("干完了");
+  s.finish();
+  const out = await p;
+  assert.equal(out, "干完了", "持续活动的一轮必须正常交付结果");
+});
+
+test("真卡死（长时间零活动）必须被空闲超时掐断", async () => {
+  const s = new FakeSession();
+  const asm = new TurnAssembler(s, { logger: silent });
+  // 不发生任何事件 → 完全静默，定时器到点后必然判空闲超时
+  const out = await asm.submit("hi", null, { timeoutMs: 80 });
+  assert.match(out, /超时/, "静默卡死必须超时");
+  assert.match(out, /没能给出回复/, "且要告知用户，不能静默");
+  assert.ok(s.abortCalls >= 1, "卡死时应 abort 上游");
+});
+
+test("空闲超时文案要说明原因，便于区分「卡死」与「空响应」", () => {
+  const src = fs.readFileSync(path.join(ROOT, "lib/agent/turn-assembler.mjs"), "utf8");
+  assert.match(src, /空闲超时/, "日志与注释须体现「空闲」语义");
+  assert.match(src, /idleTimer/, "必须有可重置的空闲计时器");
+});
+
+test("可选总时长硬上限：默认不设，配置后才启用", () => {
+  const src = fs.readFileSync(path.join(ROOT, "lib/agent/turn-assembler.mjs"), "utf8");
+  // 找准代码点（文件里有多处提到「总时长」，注释里的不算）
+  const i = src.indexOf("if (totalTimeoutMs > 0)");
+  assert.ok(i > 0, "必须存在「仅当配置了才挂总时长定时器」的判断");
+  assert.match(
+    src.slice(0, i),
+    /submitTotalTimeoutMs \?\? DEFAULTS\.pi\.submitTotalTimeoutMs/,
+    "默认值须走 config DEFAULTS（不就地写死）",
+  );
+  const cfgSrc = fs.readFileSync(path.join(ROOT, "lib/config.mjs"), "utf8");
+  assert.match(cfgSrc, /submitTotalTimeoutMs: 0/, "DEFAULTS 里必须为 0（否则又退回总时长超时）");
+});
+
+test("默认 logger 不得是裸 console（否则日志漏时间戳）", () => {
+  const src = fs.readFileSync(path.join(ROOT, "lib/agent/turn-assembler.mjs"), "utf8");
+  assert.doesNotMatch(
+    src,
+    /logger\s*=\s*console/,
+    "默认 logger 用 console 会绕过 lib/log.mjs，输出没有时间戳 —— 必须走 createLogger",
+  );
+  assert.match(src, /createLogger\(/, "默认 logger 必须由 createLogger 构造");
+});
+
+test("默认 logger 输出的每个 [dbg-submit] 行都带完整时间戳", async () => {
+  // 不传 logger → 用默认值（这一步就是回归点：以前落到 console，裸写 stdout）
+  const s = new FakeSession();
+  const chunks = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (c) => {
+    chunks.push(String(c));
+    return true;
+  };
+  try {
+    const asm = new TurnAssembler(s);
+    const p = asm.submit("hi", null, {});
+    await tick();
+    s.stream("ok");
+    s.finish();
+    await p;
+  } finally {
+    process.stdout.write = orig;
+  }
+  const out = chunks.join("");
+  // node 测试运行器也在往 stdout 写 TAP（可能与本模块的日志共用一行、不含换行），
+  // 所以不能按行切分；直接在整段输出里定位「完整时间戳 + [dbg-submit] settle」的片段。
+  const hits = [
+    ...out.matchAll(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \[info\]\[asm\] \[dbg-submit\] settle · deltaCount=\d+/g),
+  ];
+  assert.ok(hits.length > 0, `默认 logger 必须真输出带时间戳的 settle 行（否则本测试失去意义），实际捕获: ${out.slice(0, 200)}`);
+  // 反向确认：不存在「裸的」[dbg-submit] settle（即前面没有完整时间戳的那些）
+  const bare = [
+    ...out.matchAll(/(?<!\d{2}:\d{2}\.\d{3} \[info\]\[asm\] )\[dbg-submit\] settle · deltaCount=\d+/g),
+  ];
+  assert.equal(bare.length, 0, `不得存在无时间戳的 settle 行（命中 ${bare.length} 次）`);
 });

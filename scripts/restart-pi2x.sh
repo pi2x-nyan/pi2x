@@ -89,6 +89,29 @@ fi
 PREV_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo "")"
 
 # ── 3) 停旧进程 ───────────────────────────────────────────────────────────
+#
+# 【为什么必须先上「重启锁」】
+# 看门狗由 cron **每分钟**巡检一次（见 crontab：*/1 * * * * watchdog.mjs），
+# 它只看「进程是否存活 + 心跳是否新鲜」，并不知道此刻有人正在重启。
+# 而本脚本从杀进程到新进程就绪之间有一段空窗（实测 20:28:11 停 → 20:29:05 起，约 54 秒）。
+# 若 cron 恰好落在这个窗口里，看门狗会判定「正常模式挂了」并抢先拉起，
+# 于是用户收到的是「🔧 被看门狗自动拉起」而不是「已重启完成」——
+# 两次真实重启都撞上了这个竞态。
+#
+# 锁的语义（**不是**「锁存在就一直跳过」）：
+#   · 看门狗只在**第一次**看到这把锁时跳过一轮，并把 lockId 记进 state/restart.lock.seen；
+#   · 第二轮起即便锁还在，它也照常探活 —— 一把残留死锁不该让探活永久失效。
+# 于是等价于「重启最多被容忍 120 秒」（config.lifecycle.restartLockTtlMs）：
+# 锁过期后看门狗立刻接管；脚本被 kill、锁没清掉，也不会挡住探活。
+LOCK="$ROOT_DIR/state/restart.lock"
+mkdir -p "$ROOT_DIR/state" 2>/dev/null
+# ⚠ 时间戳必须用**毫秒**（`date +%s%3N`），不能是 `date +%s`（秒）。
+# 看门狗那边用 Node 的 Date.now()（毫秒）做差值；量纲不一致会差 1000 倍，
+# 于是刚写的锁被判定「过期 56 年」形同虚设 —— 踩过一次（2026-09-13）。
+echo "$$ $(date +%s%3N)" > "$LOCK" 2>/dev/null
+cleanup_lock() { rm -f "$LOCK" 2>/dev/null; }
+trap cleanup_lock EXIT INT TERM
+
 sleep 1
 pkill -f 'bridge[.]mjs' 2>/dev/null
 for _ in $(seq 1 10); do

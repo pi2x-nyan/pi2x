@@ -50,7 +50,7 @@
     "dbPath": "./workspace/memories/memory.db",
     "modelDir": "./workspace/memories/models",
     "sandboxDir": "./sandbox",
-    "harvestIntervalMin": 10,
+    "harvestIntervalMin": 0,
     "maxFacts": 500,
     "injectChars": 2500,
     "harvestModel": "<用于记忆提取的模型>",

@@ -10,6 +10,17 @@ say() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 # 0) 清理僵尸 screen
 screen -wipe >/dev/null 2>&1
 
+# 0.2) /dev 设备节点自愈（chroot 环境必备）
+# 坑：chroot 的 /dev 是普通空目录（非 devtmpfs），一旦被清空，/dev/urandom 消失
+# → git 提交报 "unable to get random bytes for temporary file"，Node 取不到熵。
+# 必须在 git/服务启动之前跑。
+if head -c 8 /dev/urandom >/dev/null 2>&1 && [ -c /dev/null ]; then
+  say "/dev 设备节点正常"
+else
+  say "修复 /dev 设备节点..."
+  bash <PI2X_ROOT>/scripts/devnodes-selfheal.sh >> "$LOG" 2>&1
+fi
+
 # 0.5) cron 守护进程（所有定时任务的前提：watchdog/提醒）
 # 坑：本机是 chroot/Android 环境，无 systemd，cron 不会自启；不显式拉起则 crontab 全部静默失效
 if pgrep -x cron >/dev/null 2>&1; then
@@ -19,6 +30,17 @@ else
   /usr/sbin/cron
   sleep 2
   say "cron pid: $(pgrep -x cron | head -1)"
+fi
+
+# 0.6) sshd（远程访问通道；容器是 chroot，无 systemd，不会自启）
+# 坑：没有 sshd 时，手机重启后只能靠 USB/adb 才能进容器，局域网 SSH 全是 Connection refused
+if pgrep -x sshd >/dev/null 2>&1 || ss -ltn 2>/dev/null | grep -q ':22 '; then
+  say "sshd 已在运行"
+else
+  say "启动 sshd..."
+  service ssh start >/dev/null 2>&1 || /usr/sbin/sshd >/dev/null 2>&1
+  sleep 2
+  say "sshd: $(ss -ltn 2>/dev/null | grep -c ':22 ')"
 fi
 
 # 1) NapCat（QQ）

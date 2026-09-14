@@ -42,6 +42,12 @@ const HEADER_TIMEOUT_MS = Number(process.env.COMMANDCODE_HEADER_TIMEOUT_MS ?? 60
 const IDLE_TIMEOUT_MS = Number(process.env.COMMANDCODE_IDLE_TIMEOUT_MS ?? 300000);
 /** 账号池轮询轮数（网络抖动时多试一轮） */
 const ATTEMPT_ROUNDS = Number(process.env.COMMANDCODE_ATTEMPT_ROUNDS ?? 2);
+/** 账号 429/额度超限后的冷却时长（默认 10 分钟；命中 Retry-After 时以它为准，上限 1 小时）。
+ *  作用：把「已超额」的账号暂时踢出轮询，避免每次都白跑一次再切（省 ~2s/请求 的额外延迟）。 */
+const COOLDOWN_MS = Number(process.env.COMMANDCODE_429_COOLDOWN_MS ?? 600000);
+const COOLDOWN_MAX_MS = Number(process.env.COMMANDCODE_429_COOLDOWN_MAX_MS ?? 3600000);
+/** 账号名 -> 冷却到期时间戳 */
+const coolingUntil = new Map();
 const RETRY_STATUS = new Set([401, 402, 403, 408, 429, 500, 502, 503, 504]);
 
 /** 对外模型名 -> 上游真实模型名 */
@@ -278,11 +284,25 @@ const server = http.createServer(async (req, res) => {
           return endRes();
         }
         const start = rr++ % pool.length;
+        // 候选顺序：从轮询起点开始，但把「冷却中」的账号排到最后（全在冷却时仍按原顺序试）
+        const now0 = Date.now();
+        const ordered = [];
+        for (let i = 0; i < pool.length; i++) ordered.push(pool[(start + i) % pool.length]);
+        const candidates = [
+          ...ordered.filter((a) => (coolingUntil.get(a.name) ?? 0) <= now0),
+          ...ordered.filter((a) => (coolingUntil.get(a.name) ?? 0) > now0),
+        ];
+        const nCooling = candidates.length - candidates.filter((a) => (coolingUntil.get(a.name) ?? 0) <= now0).length;
+        if (nCooling > 0) {
+          const names = ordered.filter((a) => (coolingUntil.get(a.name) ?? 0) > now0)
+            .map((a) => a.name + "(" + Math.ceil(((coolingUntil.get(a.name) - now0) / 60000)) + "min)").join(", ");
+          console.log(`[cc-go] 冷却中跳过 ${nCooling} 个账号: ${names}`);
+        }
         let up = null, acct = null, lastErr = "no attempt";
         outer: for (let round = 0; round < Math.max(1, ATTEMPT_ROUNDS); round++) {
-          for (let i = 0; i < pool.length; i++) {
+          for (let i = 0; i < candidates.length; i++) {
             if (ac.signal.aborted) return endRes();
-            const cand = pool[(start + i) % pool.length];
+            const cand = candidates[i];
             const tAttempt = Date.now();
             const ac2 = new AbortController();
             const onClientAbort = () => { try { ac2.abort(); } catch {} };
@@ -296,9 +316,15 @@ const server = http.createServer(async (req, res) => {
                 signal: ac2.signal,
               });
               clearTimeout(headerTimer);
-              if (r.ok) { up = r; acct = cand; break outer; }
+              if (r.ok) { up = r; acct = cand; coolingUntil.delete(cand.name); break outer; }
               const t = await r.text().catch(() => "");
               lastErr = `upstream ${r.status}: ${t.slice(0, 200)}`;
+              if (r.status === 429 || r.status === 402) {
+                const ra = Number(r.headers.get("retry-after"));
+                const cd = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, COOLDOWN_MAX_MS) : COOLDOWN_MS;
+                coolingUntil.set(cand.name, Date.now() + cd);
+                console.log(`[cc-go] 账号 ${cand.name} 额度/限流(${r.status})，冷却 ${(cd / 60000).toFixed(1)} 分钟后重试`);
+              }
               console.log(`[cc-go] 账号 ${cand.name} 失败(${r.status}) ${((Date.now()-tAttempt)/1000).toFixed(1)}s，切换下一个`);
               if (!RETRY_STATUS.has(r.status)) { clearTimeout(headerTimer); break outer; }
             } catch (e) {

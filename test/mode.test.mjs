@@ -16,7 +16,9 @@ import {
   decide,
   resetAttempts,
 } from "../lib/mode.mjs";
+import { checkRestartLock } from "../lib/lifecycle.mjs";
 
+const ROOT = path.resolve(import.meta.dirname, "..");
 const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "mode-"));
 const cleanup = (d) => fs.rmSync(d, { recursive: true, force: true });
 
@@ -263,4 +265,82 @@ test("回归：陈旧残留心跳不会导致刚启动的进程被误判为卡�
   });
   assert.equal(d2.action, "none", "应判定健康，而不是准备重启一个刚启动的进程");
   cleanup(d);
+});
+
+// ── 重启锁：只跳一轮（2026-09-13 真实事故）──────────────────────────────
+
+test("重启锁：第一次跳过，第二轮照常探活（同一把锁只跳一次）", () => {
+  // 【事故】watchdog 由 cron 每分钟跑一次，只看「进程存活+心跳新鲜」，不知道有人在重启。
+  // restart-pi2x.sh 从杀进程到新进程就绪有约 54 秒空窗，cron 落进去就抢先拉起，
+  // 用户收到的是「被看门狗自动拉起」而不是「已重启完成」。两次真实重启都撞上了。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lock-"));
+  const now = Date.now();
+  fs.writeFileSync(path.join(dir, "restart.lock"), `1234 ${now}`);
+
+  const first = checkRestartLock({ stateDir: dir, now });
+  assert.equal(first.skip, true, "第一次必须跳过（正在重启）");
+
+  const second = checkRestartLock({ stateDir: dir, now: now + 30_000 });
+  assert.equal(second.skip, false, "同一把锁第二轮不得再跳（否则残留死锁让探活永久失效）");
+});
+
+test("重启锁：过期即失效（重启最多被容忍 TTL 这么久）", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lock-"));
+  const now = Date.now();
+  fs.writeFileSync(path.join(dir, "restart.lock"), `1234 ${now}`);
+  const r = checkRestartLock({ stateDir: dir, now: now + 200_000, ttlMs: 120_000 });
+  assert.equal(r.skip, false, "超过 TTL 必须照常探活");
+  assert.match(r.reason, /过期/);
+});
+
+test("重启锁：换了新锁（新一轮重启）应重新跳过一轮", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lock-"));
+  const now = Date.now();
+  fs.writeFileSync(path.join(dir, "restart.lock"), `1111 ${now}`);
+  assert.equal(checkRestartLock({ stateDir: dir, now }).skip, true, "第一把锁：跳过");
+  assert.equal(checkRestartLock({ stateDir: dir, now: now + 1000 }).skip, false, "第一把锁：第二轮不跳");
+  // 新一次重启写了新锁
+  fs.writeFileSync(path.join(dir, "restart.lock"), `2222 ${now + 2000}`);
+  assert.equal(
+    checkRestartLock({ stateDir: dir, now: now + 3000 }).skip,
+    true,
+    "新锁要重新享有一轮豁免",
+  );
+});
+
+test("重启锁：无锁 / 内容损坏都不得跳过", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lock-"));
+  assert.equal(checkRestartLock({ stateDir: dir, now: Date.now() }).skip, false, "无锁 → 不跳");
+  fs.writeFileSync(path.join(dir, "restart.lock"), "垃圾内容");
+  assert.equal(checkRestartLock({ stateDir: dir, now: Date.now() }).skip, false, "损坏 → 不跳");
+});
+
+test("重启锁：时间戳必须按毫秒解读（秒级会误判成过期 56 年）", () => {
+  // 【真实事故】restart-pi2x.sh 用 `date +%s`（秒，1789303067）写锁，
+  // 看门狗用 Node 的 Date.now()（毫秒，1789303067472）做差值 → 差 1000 倍，
+  // 刚写的锁被判定「过期 1787513755 秒」，整个防抢拉机制形同虚设。
+  // 这条守住量纲：毫秒级时间戳必须被认作「未过期」。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lock-"));
+  const nowMs = Date.now();
+  fs.writeFileSync(path.join(dir, "restart.lock"), `9999 ${nowMs}`);
+  assert.equal(checkRestartLock({ stateDir: dir, now: nowMs }).skip, true, "毫秒时间戳：应视为未过期");
+
+  // 反向：若误写成秒级（同一时刻的秒），会被判过期 —— 说明修复前就是这样失效的
+  const nowSec = Math.floor(nowMs / 1000);
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "lock-"));
+  fs.writeFileSync(path.join(dir2, "restart.lock"), `9999 ${nowSec}`);
+  const r = checkRestartLock({ stateDir: dir2, now: nowMs });
+  assert.equal(r.skip, false, "秒级时间戳会被判过期（这正是当初的 bug 表现）");
+  assert.match(r.reason, /过期/);
+});
+
+test("restart-pi2x.sh 写锁必须用毫秒（date +%s%3N）", () => {
+  const src = fs.readFileSync(path.join(ROOT, "scripts/restart-pi2x.sh"), "utf8");
+  // 锚定赋值行本身（注释里也提到 restart.lock，不能拿它当锚点）
+  const i = src.indexOf('LOCK="$ROOT_DIR/state/restart.lock"');
+  assert.ok(i > 0, "找不到锁的写入点");
+  const seg = src.slice(i, i + 800);
+  assert.ok(seg.includes("date +%s%3N"), "必须用毫秒时间戳 date +%s%3N");
+  const writeLine = seg.split("\n").find((l) => l.includes("> \"$LOCK\"")) ?? "";
+  assert.ok(writeLine.includes("%3N"), `写锁那行必须带毫秒（实际：${writeLine.trim()}）`);
 });
