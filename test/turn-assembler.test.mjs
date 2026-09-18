@@ -424,14 +424,16 @@ test("默认 logger 输出的每个 [dbg-submit] 行都带完整时间戳", asyn
   }
   const out = chunks.join("");
   // node 测试运行器也在往 stdout 写 TAP（可能与本模块的日志共用一行、不含换行），
-  // 所以不能按行切分；直接在整段输出里定位「完整时间戳 + [dbg-submit] settle」的片段。
+  // 所以不能按行切分；直接在整段输出里定位「完整时间戳 + 日志头 + [dbg-submit] settle」的片段。
   const hits = [
-    ...out.matchAll(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \[info\]\[asm\] \[dbg-submit\] settle · deltaCount=\d+/g),
+    ...out.matchAll(
+      /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \[LOG\]\[info\]\[asm\] \[dbg-submit\] settle · deltaCount=\d+/g,
+    ),
   ];
-  assert.ok(hits.length > 0, `默认 logger 必须真输出带时间戳的 settle 行（否则本测试失去意义），实际捕获: ${out.slice(0, 200)}`);
-  // 反向确认：不存在「裸的」[dbg-submit] settle（即前面没有完整时间戳的那些）
+  assert.ok(hits.length > 0, `默认 logger 必须真输出带时间戳与日志头的 settle 行（否则本测试失去意义），实际捕获: ${out.slice(0, 200)}`);
+  // 反向确认：不存在「裸的」[dbg-submit] settle（即前面没有完整时间戳+日志头的那些）
   const bare = [
-    ...out.matchAll(/(?<!\d{2}:\d{2}\.\d{3} \[info\]\[asm\] )\[dbg-submit\] settle · deltaCount=\d+/g),
+    ...out.matchAll(/(?<!\[LOG\]\[info\]\[asm\] )\[dbg-submit\] settle · deltaCount=\d+/g),
   ];
-  assert.equal(bare.length, 0, `不得存在无时间戳的 settle 行（命中 ${bare.length} 次）`);
+  assert.equal(bare.length, 0, `不得存在无时间戳/无日志头的 settle 行（命中 ${bare.length} 次）`);
 });

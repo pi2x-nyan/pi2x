@@ -1,7 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { cosineSim, detectToolLeak, clip, fmtMs } from "../lib/text.mjs";
+import {
+  cosineSim,
+  detectToolLeak,
+  clip,
+  fmtMs,
+  INJECT_BEGIN,
+  INJECT_END,
+  wrapInjected,
+  hasInjectedBlock,
+  stripWrappedInjected,
+} from "../lib/text.mjs";
 
 test("cosineSim：完全相同 → 1，完全不同 → 0", () => {
   assert.equal(cosineSim("你好世界", "你好世界"), 1);
@@ -52,4 +62,55 @@ test("clip / fmtMs：边界与格式", () => {
   assert.equal(fmtMs(1500), "1.5s");
   assert.equal(fmtMs(65_000), "1m5s");
   assert.equal(fmtMs("x"), "?");
+});
+
+// ── 注入块边界（让模型分清「自己说的」与「系统注入的」）────────────────
+
+test("wrapInjected：包上首尾机器边界", () => {
+  const w = wrapInjected("【记忆】\n- [fact] x");
+  assert.ok(w.startsWith(INJECT_BEGIN), "必须以起始标记开头");
+  assert.ok(w.endsWith(INJECT_END), "必须以结束标记结尾");
+  assert.ok(w.includes("【记忆】"), "正文应保留");
+});
+
+test("wrapInjected：空内容返回空串（调用方据此跳过注入）", () => {
+  assert.equal(wrapInjected(""), "");
+  assert.equal(wrapInjected("   "), "");
+  assert.equal(wrapInjected(null), "");
+});
+
+test("stripWrappedInjected：剥掉注入块，保留用户原话", () => {
+  const t = `主人，帮我看看\n\n${wrapInjected("【记忆】\n- [fact · 3天前] 某事实")}`;
+  assert.equal(stripWrappedInjected(t), "主人，帮我看看");
+});
+
+test("stripWrappedInjected：多次注入都能剥净", () => {
+  const t = `A\n\n${wrapInjected("X")}\n\nB\n\n${wrapInjected("Y")}\n\nC`;
+  const out = stripWrappedInjected(t);
+  assert.ok(!out.includes("X") && !out.includes("Y"), "两块都该剥掉");
+  assert.ok(out.includes("A") && out.includes("B") && out.includes("C"), "正文须完整保留");
+});
+
+test("stripWrappedInjected：未闭合时保守丢到起点（不吞后面的正文）", () => {
+  const t = "用户原话\n\n" + INJECT_BEGIN + "\n没闭合";
+  assert.equal(stripWrappedInjected(t), "用户原话");
+});
+
+test("stripWrappedInjected：无注入块时原样返回（幂等）", () => {
+  const t = "就是一段普通文本，没有注入";
+  assert.equal(stripWrappedInjected(t), t);
+  assert.equal(stripWrappedInjected(t), stripWrappedInjected(stripWrappedInjected(t)));
+});
+
+test("hasInjectedBlock：能识别边界（供校验/断言用）", () => {
+  assert.equal(hasInjectedBlock(wrapInjected("x")), true);
+  assert.equal(hasInjectedBlock("普通文本"), false);
+  assert.equal(hasInjectedBlock(""), false);
+});
+
+test("边界标记是纯 ASCII（不与正文的中文方括号混淆）", () => {
+  for (const m of [INJECT_BEGIN, INJECT_END]) {
+    // eslint-disable-next-line no-control-regex
+    assert.match(m, /^<<<[A-Z:]+>>>$/, `标记应为纯 ASCII 尖括号包裹，实际: ${m}`);
+  }
 });

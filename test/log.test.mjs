@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { log, createLogger, withTurn, currentTurn, setLevel, getLevel } from "../lib/log.mjs";
+import { log, createLogger, withTurn, currentTurn, setLevel, getLevel, LOG_HEAD } from "../lib/log.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -228,4 +228,41 @@ test("LOG_FORMAT=json 输出合法 JSON Lines（子进程验证）", () => {
   assert.equal(obj.msg, "结构化消息 {\"n\":1}");
   assert.ok(obj.ts, "应有 ISO 时间戳");
   assert.equal(obj.turn, null);
+});
+
+// ── 日志头（区分「日志」与「用户发言」）──────────────────────────────
+
+test("每一行日志都带 [LOG] 头（防止形似对话的日志被当成用户发言）", () => {
+  const prev = getLevel();
+  setLevel("info");
+  const out = capture(() => createLogger("recv").info("private:123 <某人>: 注意语气"));
+  assert.ok(out.startsWith(`${out.slice(0, 23)}${LOG_HEAD}`) || out.includes(LOG_HEAD), "必须含日志头");
+  assert.match(out, /\[LOG\]\[info\]\[recv\]/, "日志头应紧跟在时间戳后");
+  setLevel(prev);
+});
+
+test("日志头常量就是 [LOG]（便于静态识别）", () => {
+  assert.equal(LOG_HEAD, "[LOG]");
+});
+
+test("多行日志：每一行都带完整头部（续行不再是无头裸文本）", () => {
+  const prev = getLevel();
+  setLevel("info");
+  const out = capture(() => createLogger("pi").info("新会话 a\n   权限: x, y\n   备注: z"));
+  const lines = out.split("\n").filter(Boolean);
+  assert.equal(lines.length, 3, `应输出 3 行，实际 ${lines.length}`);
+  for (const l of lines) {
+    assert.match(l, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \[LOG\]\[info\]\[pi\] /, `续行也要带头部: ${l}`);
+  }
+  assert.match(lines[1], /^.*╎ /, "续行应用 ╎ 标出");
+  assert.match(lines[1], /权限: x, y/);
+  setLevel(prev);
+});
+
+test("单行日志不会被拆（不引入多余换行）", () => {
+  const prev = getLevel();
+  setLevel("info");
+  const out = capture(() => createLogger("t").info("就一行"));
+  assert.equal(out.split("\n").filter(Boolean).length, 1);
+  setLevel(prev);
 });
