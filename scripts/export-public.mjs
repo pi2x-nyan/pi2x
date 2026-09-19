@@ -196,9 +196,26 @@ function main() {
 
   // ── 3) 安全扫描 ──────────────────────────────────────────────────────
   if (SKIP_SCAN) {
-    console.log("【3/3】已跳过安全扫描（--skip-scan，强烈建议不要这么用）");
+    // 【为什么加了这道闸门】#
+    // 原先 --skip-scan 一敲就整段跳过扫描、退出码也不受影响 —— 一个“发布前唯一
+    // 机械守住密钥的环节”就这么被一个顺手的参数关掉了，而且没有任何痕迹。
+    // 现在改成需要双确认：得同时给 --skip-scan 与 --i-know-its-unsafe，
+    // 并在输出里留下大声的告警（后人看日志能发现这次导出没扫过）。
+    if (!ARGS.includes("--i-know-its-unsafe")) {
+      console.error("✗ --skip-scan 已禁用：发布前的密钥扫描是最后一道机械闸门，不允许随手关掉。");
+      console.error("  确实需要跳过（例如本地演练），请同时加上 --i-know-its-unsafe 表示你知情。");
+      if (fs.existsSync(OUT)) {
+        fs.rmSync(OUT, { recursive: true, force: true });
+        console.error(`  已删除导出目录 ${OUT}（不留下未扫描的产物）`);
+      }
+      process.exit(1);
+    }
+    console.warn("\n  \u001b[41m ⚠ 本次导出**未经密钥扫描** \u001b[0m");
+    console.warn("  该产物不得直接 push 到公开仓库；请事后手动跑：");
+    console.warn(`      node scripts/scan-secrets.mjs --history\n`);
+    console.log("【3/3】已跳过安全扫描（--skip-scan --i-know-its-unsafe）");
   } else {
-    const scan = spawnSync(process.execPath, [path.join(ROOT, "scripts", "scan-secrets.mjs")], {
+    const scan = spawnSync(process.execPath, [path.join(ROOT, "scripts", "scan-secrets.mjs"), "--history"], {
       encoding: "utf8",
       env: { ...process.env, PI2X_SCAN_ROOT: OUT, FORCE_COLOR: "0" },
     });
