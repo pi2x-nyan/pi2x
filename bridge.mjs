@@ -164,12 +164,27 @@ async function collectImages(ev, bridge) {
   // ① 顶层图片（原有行为）
   refs.push(...QQBridge.extractImages(ev.message));
 
-  // ② 引用消息里带的图（reply 段可能内联了被引用消息的 message 结构）
+  // ② 引用消息里带的图
+  //    NapCat 的 reply 段通常**只有 id**，不内联被引用消息的正文 ——
+  //    这就是「引用一张图问它是什么，bot 回看不见图」的根因（2026-11-03 群里复现）。
+  //    所以：先看有没有内联，没有就按 id 回捞一次 get_msg。
   for (const seg of Array.isArray(ev.message) ? ev.message : []) {
-    if (seg?.type === "reply" && seg.data) {
-      const nested = QQBridge.collectImageRefs(seg.data.message ?? seg.data.content ?? []);
-      if (nested.length) refs.push(...nested);
+    if (seg?.type !== "reply" || !seg.data) continue;
+    let nested = QQBridge.collectImageRefs(seg.data.message ?? seg.data.content ?? []);
+    if (!nested.length) {
+      const qid = seg.data.id ?? seg.data.message_id;
+      if (qid) {
+        try {
+          const quoted = await bridge.getMsg(qid);
+          const msg = quoted?.message ?? quoted?.data?.message ?? [];
+          nested = QQBridge.collectImageRefs(msg);
+          if (nested.length) logImg.info(`引用消息(${qid})内补捞到 ${nested.length} 张图`);
+        } catch (e) {
+          logImg.warn(`引用消息(${qid})回捞失败: ${e?.message}`);
+        }
+      }
     }
+    if (nested.length) refs.push(...nested);
   }
 
   // ③ 合并转发里的图（expandForward 已把它们抽好存在 ev._forwardImages）

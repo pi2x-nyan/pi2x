@@ -1,0 +1,667 @@
+#!/usr/bin/env node
+/**
+ * mooc-runner.mjs —— 超星《2026秋-创新创业基础》视频任务点常驻推进器
+ *
+ * 只做一件事：按章节顺序找第一个「未完成」的视频任务点，正常 1x 播到结束/≥95%，
+ * 回章节页读一次「已完成任务点 x/96」记日志，然后继续下一个。
+ *
+ * 硬约束（代码里也钉死）：
+ *   · 只播 1 倍速，不改 playbackRate
+ *   · 不拖时间轴（全程不写 currentTime），不静音（不碰 muted/volume）
+ *   · 只碰这一门课，其他课程一概不导航
+ *   · 检测到滑块/人脸/验证码/「异常」提示 → 立刻停，日志记原因，退出码 3
+ *   · 进度停滞保护：连续 10 分钟 currentTime 不增长 → 判定卡住，退出码 4
+ *
+ * 浏览器隔离：默认走 :9333 的独立实例（profile 在 <PI2X_ROOT>/tmp/mooc/profile），
+ * 不再占用管理员的 9222 实例。启动方式见 <PI2X_ROOT>/tmp/mooc/start-chrome.sh。
+ *
+ * 用法：node <PI2X_ROOT>/scripts/mooc-runner.mjs [--minutes 45] [--port 9333]
+ * 日志：<PI2X_ROOT>/tmp/mooc/runner.log（每行带时间戳）
+ * 状态：<PI2X_ROOT>/tmp/mooc/state.json
+ * 退出码：0=时间预算到 / 2=browser-cli 看门狗超时 / 3=验证码异常 / 4=卡住 /
+ *         5=需要人工介入（连续 3 次自愈失败 / 任务点不涨）/ 6=掉线（跳到登录页）/ 1=其它错误
+ *
+ * video 元素消失自愈：先截图 + dump url/title/可见文字，再确保 :9333 上是挂课专用 Chrome
+ * （browser-cli 会在端口空掉时用 browser-profile-op 偷偷补一只别的 Chrome，必须清掉重起），
+ * 然后重新打开同一章节继续播；连续 3 次恢复不了才退出码 5，并把最后一屏写进 STOPPED。
+ */
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
+const CLI = "<PI2X_ROOT>/scripts/browser-cli.mjs";
+const CHROME_PROFILE = "<PI2X_ROOT>/tmp/mooc/profile";
+const STALL_LIMIT_MS = 10 * 60_000; // 连续 10 分钟 currentTime 不增长 → 判定卡住（退出码 4）
+const OUT_DIR = "<PI2X_ROOT>/tmp/mooc";
+const LOG_PATH = path.join(OUT_DIR, "runner.log");
+const STATE_PATH = path.join(OUT_DIR, "state.json");
+const COURSE_NAME = "2026秋-创新创业基础";
+
+// 已知课程标识（发现流程失败时兜底用）
+const FALLBACK = { courseId: "267796608", clazzId: "156514940", cpi: "537306069" };
+
+const argv = process.argv.slice(2);
+function argNum(name, dflt) {
+  const i = argv.indexOf(name);
+  if (i < 0) return dflt;
+  const v = Number(argv[i + 1]);
+  return Number.isFinite(v) && v > 0 ? v : dflt;
+}
+const minutes = argNum("--minutes", 60);
+const PORT = argNum("--port", 9333); // 默认独立实例；切勿再用 9222（管理员实例）
+const deadline = Date.now() + minutes * 60_000;
+
+fs.mkdirSync(OUT_DIR, { recursive: true });
+
+/* ---------------------------------- 日志与状态 ---------------------------------- */
+
+const pad = (n) => String(n).padStart(2, "0");
+function ts() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function log(msg) {
+  const line = `[${ts()}] ${msg}`;
+  try { fs.appendFileSync(LOG_PATH, line + "\n"); } catch {}
+  console.log(line);
+}
+
+const state = {
+  pid: process.pid,
+  startedAt: ts(),
+  port: PORT,
+  chromeProfile: CHROME_PROFILE,
+  minutesBudget: minutes,
+  currentVideo: null,
+  progress: "",
+  progressPercent: 0,
+  completedPoints: null,
+  totalPoints: null,
+  progressText: "",
+  playedVideos: 0,
+  phase: "starting",
+  updatedAt: ts(),
+};
+function saveState(patch = {}) {
+  Object.assign(state, patch);
+  state.updatedAt = ts();
+  try { fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 1)); } catch (e) { log("写 state.json 失败: " + e.message); }
+}
+saveState();
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const elapsedMin = () => ((Date.now() - (deadline - minutes * 60_000)) / 60_000).toFixed(1);
+const outOfTime = () => Date.now() >= deadline;
+
+/* ------------------------- 浏览器健康检查与自愈 ------------------------- */
+
+const RECOVER_MAX = 3; // 连续 3 次恢复失败才退出（退出码 5）
+
+/** 找出 :PORT 上的 Chrome 主进程（排除 --type= 子进程），带 user-data-dir */
+function chromeMainPids() {
+  let out = "";
+  try {
+    out = spawnSync("bash", ["-lc", `pgrep -f 'remote-debugging-port=${PORT}' || true`], { encoding: "utf8" }).stdout || "";
+  } catch {}
+  return out
+    .split("\n").map((s) => s.trim()).filter(Boolean).map(Number).filter((p) => p > 0 && p !== process.pid)
+    .map((p) => {
+      let cmd = "";
+      try { cmd = fs.readFileSync(`/proc/${p}/cmdline`, "utf8").replace(/\0/g, " ").trim(); } catch {}
+      const m = cmd.match(/--user-data-dir=(\S+)/);
+      return { pid: p, cmd, profile: m ? m[1] : "", main: !cmd.includes("--type=") };
+    })
+    .filter((x) => x.main && x.cmd.includes("chrome"));
+}
+
+/**
+ * 确保 :PORT 上跑的是「挂课专用 profile」的 Chrome。
+ * 关键：browser-cli 在端口无人监听时会用 browser-profile-op 自动补一只 Chrome，
+ * 那只没有挂课登录态，页面直接是 about:blank —— 必须清掉，否则挂课永远恢复不了。
+ */
+function ensureMoocChrome(tag = "") {
+  const want = CHROME_PROFILE.replace(/\/+$/, "");
+  const mains = chromeMainPids();
+  const mine = mains.find((m) => m.profile.replace(/\/+$/, "") === want);
+  if (mine) return { ok: true, pid: mine.pid, restarted: false };
+
+  for (const m of mains) {
+    if (m.profile.replace(/\/+$/, "") === want) continue;
+    log(`${tag} :${PORT} 上跑的不是挂课用的 Chrome（pid=${m.pid} profile=${m.profile || "默认"}），清掉`);
+    try { spawnSync("kill", ["-TERM", String(m.pid)]); } catch {}
+    for (let i = 0; i < 16; i++) {
+      if (!fs.existsSync(`/proc/${m.pid}`)) break;
+      spawnSync("sleep", ["0.5"]);
+    }
+    try { if (fs.existsSync(`/proc/${m.pid}`)) spawnSync("kill", ["-9", String(m.pid)]); } catch {}
+    const gone = (() => { try { return !fs.existsSync(`/proc/${m.pid}`); } catch { return true; } })();
+    log(`${tag} 清掉 pid=${m.pid}：${gone ? "已退出" : "仍在（可能僵死）"}`);
+  }
+
+  log(`${tag} 启动挂课专用 Chrome（profile=${CHROME_PROFILE}）`);
+  const r = spawnSync("bash", [path.join(OUT_DIR, "start-chrome.sh")], { encoding: "utf8", timeout: 60000 });
+  const ok = r.status === 0;
+  if (!ok) log(`${tag} start-chrome.sh 失败（code=${r.status}）：${((r.stderr || "") + (r.stdout || "")).trim().slice(0, 240)}`);
+  let pid = 0;
+  try { pid = Number(fs.readFileSync(path.join(OUT_DIR, "chrome.pid"), "utf8").trim()) || 0; } catch {}
+  return { ok, pid, restarted: true };
+}
+
+function stamp() {
+  const d = new Date();
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+/** 抓现场：截图 + url/title/可见文字前 200 字，落日志与 state.json */
+function captureScreen(reason) {
+  const png = path.join(OUT_DIR, `crash-${stamp()}.png`);
+  let shot = null;
+  try { cli(["screenshot", png], 60); shot = png; } catch (e) { log(`截图失败：${e.message}`); }
+  let url = "", title = "", text = "";
+  try {
+    const d = jsJson(`(() => {
+      const t = document.body ? (document.body.innerText || "") : "";
+      let f = "";
+      try { for (const x of document.querySelectorAll("iframe")) { const b = x.contentDocument && x.contentDocument.body; if (b) f += " [iframe]" + (b.innerText || ""); } } catch (e) {}
+      return { url: location.href, title: document.title, text: (t + f).replace(/\\s+/g, " ").trim().slice(0, 200) };
+    })()`);
+    url = d.url || ""; title = d.title || ""; text = d.text || "";
+  } catch (e) { log(`读取屏幕内容失败：${e.message}`); }
+  log(`【现场】${reason} → 截图 ${shot || "(失败)"}`);
+  log(`【现场】url=${url || "(空)"}`);
+  log(`【现场】title=${title || "(空)"}`);
+  log(`【现场】可见文字=${text || "(空)"}`);
+  saveState({ lastScreen: { at: ts(), reason, screenshot: shot, url, title, text } });
+  return { png: shot, url, title, text };
+}
+
+/** about:blank / chrome-error → 浏览器没了；passport → 掉线；其它 → 页面被换了 */
+function classifyGone(ev) {
+  const u = (ev && ev.url) || "";
+  if (!u || u === "about:blank" || /^(chrome|edge)-error:/.test(u)) return "browser-lost";
+  if (/passport|\/login|sso\.|i\.chaoxing\.com\/login/i.test(u)) return "session-lost";
+  try { const h = new URL(u).host; if (h && !/(^|\.)chaoxing\.com$/.test(h)) return "browser-lost"; } catch { return "browser-lost"; }
+  return "page-changed";
+}
+
+/* ------------------------------ browser-cli 封装 ------------------------------ */
+
+function cli(args, timeoutSec = 90) {
+  const r = spawnSync(
+    "node",
+    [CLI, "--port", String(PORT), "--timeout", String(timeoutSec * 1000), ...args],
+    { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: (timeoutSec + 30) * 1000 }
+  );
+  const out = (r.stdout || "").trim();
+  if (r.status !== 0) {
+    const err = (out || r.stderr || "").slice(0, 400);
+    // 码 2 = browser-cli 命令行级看门狗超时（页面没响应），交给外层 loop 重试
+    if (r.status === 2) throw new Stop(2, `browser-cli ${args[0]} 看门狗超时: ${err}`);
+    throw new Error(`browser-cli ${args[0]} 失败(code=${r.status}): ${err}`);
+  }
+  return out;
+}
+function jsRaw(expr, timeoutSec = 60) {
+  return cli(["js", expr], timeoutSec);
+}
+function jsJson(expr, timeoutSec = 60) {
+  const out = jsRaw(expr, timeoutSec);
+  try { return JSON.parse(out); } catch { throw new Error("JS 返回非 JSON: " + out.slice(0, 300)); }
+}
+async function nav(url) {
+  const out = cli(["navigate", url], 120);
+  let info = null;
+  try { info = JSON.parse(out); } catch {}
+  await sleep(1200);
+  return info;
+}
+
+/* ----------------------- 最小 CDP 通道：只为「可信手势」触发播放 -----------------------
+ * 无头 Chrome 默认拦截无用户手势的 play()（NotAllowedError）。
+ * 平台播放器本身也走 video.play()，所以我们用 CDP Runtime.evaluate 的
+ * userGesture=true 给它一次真实用户激活，等价于用户点了播放键；
+ * 不改倍速、不跳时间轴、不动音量。
+ */
+class Cdp {
+  constructor(port) { this.base = `http://127.0.0.1:${port}`; this.ws = null; this.seq = 0; this.pending = new Map(); }
+  async connect() {
+    if (this.ws && this.ws.readyState === 1) return;
+    const list = await fetch(this.base + "/json/list", { signal: AbortSignal.timeout(5000) }).then((r) => r.json());
+    const page = (list || []).find((t) => t.type === "page");
+    if (!page) throw new Error("没有可用标签页");
+    this.ws = new WebSocket(page.webSocketDebuggerUrl);
+    await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error("CDP 连接超时")), 8000);
+      this.ws.onopen = () => { clearTimeout(t); res(); };
+      this.ws.onerror = () => { clearTimeout(t); rej(new Error("CDP 连接失败")); };
+    });
+    this.ws.onmessage = (ev) => {
+      let m; try { m = JSON.parse(String(ev.data)); } catch { return; }
+      const p = m.id && this.pending.get(m.id);
+      if (!p) return;
+      this.pending.delete(m.id);
+      m.error ? p.rej(new Error(`CDP ${m.error.code}: ${m.error.message}`)) : p.res(m.result);
+    };
+    this.ws.onclose = () => { this.ws = null; };
+  }
+  send(method, params = {}, timeoutMs = 20000) {
+    return new Promise((res, rej) => {
+      const id = ++this.seq;
+      const timer = setTimeout(() => { this.pending.delete(id); rej(new Error("CDP 超时: " + method)); }, timeoutMs);
+      this.pending.set(id, {
+        res: (v) => { clearTimeout(timer); res(v); },
+        rej: (e) => { clearTimeout(timer); rej(e); },
+      });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+  async eval(expr, { gesture = false, timeoutMs = 25000 } = {}) {
+    await this.connect();
+    const r = await this.send("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true, userGesture: gesture }, timeoutMs);
+    if (r.exceptionDetails) throw new Error((r.exceptionDetails.exception?.description || r.exceptionDetails.text || "JS 异常").slice(0, 300));
+    return r.result?.value;
+  }
+  close() { try { this.ws?.close(); } catch {} this.ws = null; }
+}
+const cdp = new Cdp(PORT);
+
+/* --------------------------------- 页面探测脚本 --------------------------------- */
+
+/** 找出 iframe 里的 video 元素 + 判断容器是否 ans-job-finished + 扫描验证/异常提示 */
+const PROBE_EXPR = `(() => {
+  const capKw = ["检测到异常","访问异常","异常行为","请完成验证","安全验证","请输入验证码","滑动验证","拖动滑块","人脸识别","人脸验证","身份验证","扫码验证"];
+  const capSel = [".yzm",".captcha","#captcha",".face-verify",".nc-container",".verifycode",".slider-verify","iframe[src*=captcha]","iframe[src*=verify]"];
+  let captcha = null;
+  const scan = (doc, where) => {
+    if (!doc || captcha) return;
+    let txt = "";
+    try { txt = doc.body ? (doc.body.innerText || "") : ""; } catch (e) {}
+    for (const k of capKw) { if (txt.indexOf(k) >= 0) { captcha = where + ":" + k; return; } }
+    for (const s of capSel) { try { if (doc.querySelector(s)) { captcha = where + ":选择器 " + s; return; } } catch (e) {} }
+  };
+  scan(document, "top");
+  const ifs = [...document.querySelectorAll("iframe")].filter(f => (f.src || "").indexOf("ananas/modules/video") >= 0);
+  const videos = ifs.map((f, i) => {
+    let fin = false, p = f.parentElement;
+    for (let k = 0; k < 5 && p; k++) {
+      const c = (p.className || "") + "";
+      if (c.indexOf("videoContainer") >= 0) { fin = c.indexOf("ans-job-finished") >= 0; break; }
+      p = p.parentElement;
+    }
+    let doc = null, v = null;
+    try { doc = f.contentDocument; v = doc ? doc.querySelector("video") : null; } catch (e) {}
+    scan(doc, "video-iframe");
+    return {
+      i, fin, hasVideo: !!v,
+      ct: v ? Math.round((v.currentTime || 0) * 10) / 10 : 0,
+      dur: v && isFinite(v.duration) ? Math.round(v.duration * 10) / 10 : 0,
+      paused: v ? v.paused : null,
+      ended: v ? v.ended : null,
+      rate: v ? v.playbackRate : null,
+      muted: v ? v.muted : null,
+      ready: v ? v.readyState : 0,
+    };
+  });
+  return { videos, captcha, url: location.href };
+})()`;
+
+/** 触发播放（可信手势）。只播放，不跳转、不变速、不静音 */
+const PLAY_EXPR = `(async () => {
+  const ifs = [...document.querySelectorAll("iframe")].filter(f => (f.src || "").indexOf("ananas/modules/video") >= 0);
+  let target = null;
+  for (const f of ifs) {
+    let p = f.parentElement, fin = false;
+    for (let k = 0; k < 5 && p; k++) {
+      const c = (p.className || "") + "";
+      if (c.indexOf("videoContainer") >= 0) { fin = c.indexOf("ans-job-finished") >= 0; break; }
+      p = p.parentElement;
+    }
+    if (!fin) { target = f; break; }
+  }
+  if (!target) return { err: "no-unfinished-video" };
+  const v = target.contentDocument && target.contentDocument.querySelector("video");
+  if (!v) return { err: "no-video-element" };
+  let msg = "ok";
+  try { if (v.paused) await v.play(); } catch (e) { msg = e.name + ":" + e.message; }
+  await new Promise(r => setTimeout(r, 2000));
+  return { msg, ct: v.currentTime, dur: v.duration, paused: v.paused, rate: v.playbackRate, muted: v.muted };
+})()`;
+
+/* ---------------------------------- 主流程 ---------------------------------- */
+
+class Stop extends Error {
+  constructor(code, reason) { super(reason); this.code = code; this.reason = reason; }
+}
+/** video 元素消失（不是主动停机），带现场证据，由 playOne 负责自愈 */
+class VideoGone extends Error {
+  constructor(evidence) { super("video 元素消失"); this.evidence = evidence; this.playedSec = 0; }
+}
+
+async function fetchNodes() {
+  const data = jsJson(`(() => {
+    const items = [...document.querySelectorAll(".chapter_item[id]")];
+    const nodes = items.map(it => {
+      const kid = it.id.replace(/^cur/, "");
+      const titleEl = it.querySelector(".catalog_name");
+      const title = (titleEl ? titleEl.innerText : "").replace(/\\s+/g, " ").trim();
+      const jobEl = it.querySelector(".knowledgeJobCount");
+      return { kid, title, job: jobEl ? Number(jobEl.value || 0) : 0 };
+    });
+    const t = document.body ? (document.body.innerText || "") : "";
+    const m = t.match(/已完成任务点[:：]?\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
+    return { nodes, done: m ? Number(m[1]) : null, total: m ? Number(m[2]) : null, title: document.title };
+  })()`);
+  return data;
+}
+
+async function readProgress(label, { expectAbove = null } = {}) {
+  let d = await fetchNodes();
+  // 平台计数偶尔延迟几秒；没涨就再等一拍
+  if (expectAbove !== null && d.done !== null && d.done <= expectAbove) {
+    await sleep(10000);
+    d = await fetchNodes();
+  }
+  const text = d.done !== null ? `已完成任务点: ${d.done}/${d.total}` : "未读到任务点计数";
+  log(`${label} ${text}`);
+  saveState({ completedPoints: d.done, totalPoints: d.total, progressText: `已完成任务点 ${d.done}/${d.total}` });
+  return d;
+}
+
+async function discover() {
+  saveState({ phase: "discovering" });
+  log("发现课程入口：打开 i.chaoxing.com");
+
+  let entry = null;
+  try {
+    await nav("https://i.chaoxing.com");
+    await sleep(2000);
+    const info = jsJson(`(() => {
+      const links = [], frames = [];
+      document.querySelectorAll("iframe").forEach(f => frames.push(f.src || ""));
+      for (const f of document.querySelectorAll("iframe")) {
+        try {
+          const d = f.contentDocument; if (!d) continue;
+          d.querySelectorAll("a").forEach(a => {
+            const t = (a.innerText || "").replace(/\\s+/g, " ").trim();
+            if (t && a.href) links.push({ t: t.slice(0, 50), h: a.href });
+          });
+        } catch (e) {}
+      }
+      return { links, frames };
+    })()`);
+    entry = (info.links.find((l) => l.t.indexOf(COURSE_NAME) >= 0) || {}).h || null;
+    if (!entry) {
+      const src = (info.frames || []).find((s) => s.indexOf("courselist") >= 0);
+      if (src) {
+        log("课程卡片不在可读 iframe 里，直接打开课程列表页");
+        await nav(src);
+        await sleep(2000);
+        const info2 = jsJson(`(() => {
+          const links = [];
+          document.querySelectorAll("a").forEach(a => {
+            const t = (a.innerText || "").replace(/\\s+/g, " ").trim();
+            if (t && a.href) links.push({ t: t.slice(0, 50), h: a.href });
+          });
+          return { links };
+        })()`);
+        entry = (info2.links.find((l) => l.t.indexOf(COURSE_NAME) >= 0) || {}).h || null;
+      }
+    }
+  } catch (e) {
+    log("课程列表读取失败：" + e.message);
+  }
+  if (!entry) throw new Stop(1, "在课程列表里没找到《" + COURSE_NAME + "》");
+
+  log("进入课程：" + entry.slice(0, 120));
+  await nav(entry.startsWith("http") ? entry : "https://v24.chaoxing.com" + entry);
+  await sleep(2000);
+
+  const cur = jsJson(`(() => {
+    const stu = [...document.querySelectorAll("iframe")].map(f => f.src || "").find(s => s.indexOf("studentcourse") >= 0) || null;
+    return { url: location.href, title: document.title, stuSrc: stu };
+  })()`);
+  log(`课程页：${cur.title || "(无标题)"}`);
+  if (cur.title && cur.title.indexOf(COURSE_NAME) < 0) throw new Stop(1, "进的不是《" + COURSE_NAME + "》，停止：" + cur.title);
+
+  let courseId = FALLBACK.courseId, clazzId = FALLBACK.clazzId, cpi = FALLBACK.cpi;
+  try {
+    const u = new URL(cur.url);
+    courseId = u.searchParams.get("courseid") || courseId;
+    clazzId = u.searchParams.get("clazzid") || clazzId;
+    cpi = u.searchParams.get("cpi") || cpi;
+  } catch {}
+
+  let stuUrl = cur.stuSrc;
+  if (!stuUrl) {
+    const enc = (() => { try { return new URL(cur.url).searchParams.get("enc") || ""; } catch { return ""; } })();
+    stuUrl = `https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/studentcourse?courseid=${courseId}&clazzid=${clazzId}&cpi=${cpi}&ut=s&stuenc=${enc}`;
+  }
+  await nav(stuUrl);
+  await sleep(1500);
+
+  return { courseId, clazzId, cpi, stuUrl };
+}
+
+function cardsUrl(c, kid) {
+  return `https://mooc1-1.chaoxing.com/knowledge/cards?clazzid=${c.clazzId}&courseid=${c.courseId}&knowledgeid=${kid}&num=0&ut=s&cpi=${c.cpi}&v=20160407-1&mooc2=1`;
+}
+
+async function openNode(c, node) {
+  log(`打开视频节点：${node.title}`);
+  saveState({ phase: "opening", currentVideo: node.title, progress: "", progressPercent: 0 });
+  await nav(cardsUrl(c, node.kid));
+  await sleep(1500);
+
+  // 等挂件渲染完：有 .ans-attach-ct 才算页面加载好，避免把「还没渲染」误判成「没有视频」
+  let ready = false;
+  for (let i = 0; i < 10; i++) {
+    const n = jsRaw("document.querySelectorAll('.ans-attach-ct').length");
+    if (Number(n) > 0) { ready = true; break; }
+    await sleep(1500);
+  }
+  if (!ready) log("页面挂件未渲染出来（继续探测）：" + node.title);
+
+  let probe = jsJson(PROBE_EXPR);
+  if (probe.captcha) throw new Stop(3, "打开视频节点时出现验证/异常提示 → " + probe.captcha);
+  if (!probe.videos.length) {
+    log("该节点没有视频（跳过）：" + node.title);
+    return { skipped: true };
+  }
+  if (probe.videos.every((v) => v.fin)) {
+    log("视频任务点已完成（跳过）：" + node.title);
+    return { skipped: true };
+  }
+
+  const p = await cdp.eval(PLAY_EXPR, { gesture: true });
+  if (!p || p.err) throw new Stop(1, "播放触发失败：" + (p ? p.err : "无返回"));
+  log(`开始播放：${node.title}（时长 ${p.dur ? Math.round(p.dur) + "s" : "待加载"}，倍速 ${p.rate}，静音 ${p.muted}）`);
+  saveState({ phase: "playing", currentVideo: node.title });
+  return { playing: true };
+}
+
+/** 播放监视：只有 video 真消失才抛 VideoGone（带现场），其它照旧抛 Stop */
+async function watchNode(c, node) {
+  let lastCt = -1, resumes = 0;
+  let lastMoveAt = Date.now(); // 最后一次 currentTime 真实增长的时刻（进度停滞保护用）
+  const t0 = Date.now();
+  for (;;) {
+    await sleep(20000);
+    const probe = jsJson(PROBE_EXPR);
+    if (probe.captcha) throw new Stop(3, "播放过程中出现验证/异常提示 → " + probe.captcha);
+
+    const v = probe.videos.find((x) => !x.fin) || probe.videos[0];
+    if (!v) {
+      // 先抓现场（截图 + url/title/可见文字），再交给外层自愈
+      const ev = captureScreen(`播放中 video 元素消失（${node.title}）`);
+      const err = new VideoGone(ev);
+      err.playedSec = Math.round((Date.now() - t0) / 1000);
+      throw err;
+    }
+
+    const pct = v.dur > 0 ? v.ct / v.dur : 0;
+    saveState({
+      currentVideo: node.title,
+      progress: `${Math.round(v.ct)}/${Math.round(v.dur)}s`,
+      progressPercent: Math.round(pct * 1000) / 10,
+      phase: "playing",
+    });
+    log(`播放中 ${node.title} → ${Math.round(v.ct)}/${Math.round(v.dur)}s (${(pct * 100).toFixed(1)}%) paused=${v.paused}${v.fin ? " 已标记完成" : ""}`);
+
+    if (v.rate !== null && v.rate !== 1) throw new Stop(1, "播放器倍速被改成 " + v.rate + "，停止");
+    if (v.ended || v.fin || (v.dur > 0 && pct >= 0.95)) break;
+
+    if (outOfTime()) { log("到点（--minutes）退出，当前视频暂停在第 " + Math.round(v.ct) + "s"); await cdp.eval(`(()=>{const f=[...document.querySelectorAll('iframe')].find(x=>(x.src||'').indexOf('ananas/modules/video')>=0);const v=f&&f.contentDocument&&f.contentDocument.querySelector('video');if(v)v.pause();return 'ok';})()`, {}); throw new Stop(0, "time budget"); }
+
+    // ---- 进度停滞保护：连续 10 分钟 currentTime 不增长 → 判定卡住，退出码 4 ----
+    if (Math.abs(v.ct - lastCt) >= 0.5) {
+      lastCt = v.ct;
+      lastMoveAt = Date.now();
+    } else {
+      const stallMs = Date.now() - lastMoveAt;
+      log(`进度停滞 ${Math.round(stallMs / 1000)}s（currentTime 停在 ${Math.round(v.ct)}s，paused=${v.paused}）`);
+      saveState({ phase: "stalled", stalledSeconds: Math.round(stallMs / 1000) });
+      if (stallMs >= STALL_LIMIT_MS) {
+        throw new Stop(4, `currentTime 连续 ${Math.round(stallMs / 60000)} 分钟未增长，判定卡住（停在 ${Math.round(v.ct)}s，paused=${v.paused}）`);
+      }
+    }
+
+    if (v.paused) {
+      resumes++;
+      if (resumes > 3) throw new Stop(4, "播放被暂停且恢复 4 次仍停住（" + pct.toFixed(1) + "%）");
+      log("检测到暂停，尝试恢复播放（第 " + resumes + " 次）");
+      await cdp.eval(PLAY_EXPR, { gesture: true });
+      continue;
+    }
+
+    if (Date.now() - t0 > 3 * 3600_000) throw new Stop(4, "单个视频播放超过 3 小时仍未结束，停止");
+  }
+
+  await sleep(3000);
+  const after = jsJson(PROBE_EXPR);
+  if (after.captcha) throw new Stop(3, "视频结束时出现验证/异常提示 → " + after.captcha);
+  const done = after.videos.some((x) => x.fin);
+  log(`视频结束：${node.title}（容器 ${done ? "ans-job-finished" : "尚未标记完成"}）`);
+  return { finished: true, marked: done };
+}
+
+/**
+ * 完整播一个节点；中途 video 元素消失就自愈（重开章节页继续播），
+ * 连续 RECOVER_MAX 次恢复不了抛退出码 5，发现落在登录页抛退出码 6。
+ */
+async function playOne(c, node) {
+  let fails = 0; // 连续恢复失败次数
+  for (;;) {
+    const opened = await openNode(c, node);
+    if (opened.skipped) return { skipped: true };
+    try {
+      return await watchNode(c, node);
+    } catch (e) {
+      if (!(e instanceof VideoGone)) throw e;
+      if ((e.playedSec || 0) >= 120) fails = 0; // 恢复后正常播过 2 分钟以上，算新事故
+      fails++;
+      const ev = e.evidence || {};
+      log(`自愈：video 元素消失，第 ${fails}/${RECOVER_MAX} 次尝试（本段已播 ${e.playedSec || 0}s）`);
+      saveState({ phase: "recovering", recoverAttempts: fails });
+
+      const kind = classifyGone(ev);
+      log(`自愈：现场判定 = ${kind}（url=${(ev.url || "空").slice(0, 120)}）`);
+      if (kind === "session-lost") throw new Stop(6, `掉线：页面跳到了登录页（${(ev.url || "").slice(0, 160)}）`);
+      if (fails > RECOVER_MAX) throw new Stop(5, `video 元素连续 ${RECOVER_MAX} 次恢复失败，放弃（${kind}）`);
+
+      const br = ensureMoocChrome("自愈");
+      if (!br.ok) { log("自愈：Chrome 起不来，本次恢复失败"); await sleep(8000); continue; }
+      await sleep(2500);
+      log("自愈：Chrome 就绪，重新打开章节页继续播");
+    }
+  }
+}
+
+async function main() {
+  log(`=== mooc-runner 启动 pid=${process.pid} 预算 ${minutes} 分钟 ===`);
+  // 先确认 :PORT 上是挂课专用 Chrome（不是 browser-cli 补的默认 profile 实例）
+  const br = ensureMoocChrome("启动");
+  if (!br.ok) throw new Stop(1, `:${PORT} 的 Chrome 起不来（start-chrome.sh 失败）`);
+  log(`Chrome 就绪：pid=${br.pid}${br.restarted ? "（刚重起）" : "（沿用）"}`);
+  const course = await discover();
+  saveState({ phase: "discovered", course: { ...course } });
+  log(`课程参数 courseid=${course.courseId} clazzid=${course.clazzId} cpi=${course.cpi}`);
+
+  let base = await fetchNodes();
+  if (base.done !== null) {
+    log(`基线任务点：${base.done}/${base.total}`);
+    saveState({ completedPoints: base.done, totalPoints: base.total, progressText: `已完成任务点 ${base.done}/${base.total}` });
+  }
+  let played = 0, nochange = 0, cursor = 0;
+
+  for (let round = 0; round < 20; round++) {
+    if (outOfTime()) { log("到点（--minutes）退出，不再开始新视频"); break; }
+    const ms = await fetchNodes();
+    if (!ms.nodes.some((n) => n.job > 0)) { log("章节列表里已无待完成任务点节点"); break; }
+    // 从上次停下的位置往后找：已完成的节点靠容器 ans-job-finished 判定后跳过
+    let handled = false;
+    for (let i = Math.min(cursor, ms.nodes.length); i < ms.nodes.length; i++) {
+      const n = ms.nodes[i];
+      if (n.job <= 0) continue;
+      if (outOfTime()) break;
+      saveState({ currentVideo: n.title, phase: "opening" });
+      const before = state.completedPoints;
+      const r = await playOne(course, n);
+      cursor = i + 1;
+      if (r.skipped) continue;
+      handled = true;
+      played++;
+      saveState({ playedVideos: played });
+      // 回章节列表读任务点
+      await nav(course.stuUrl);
+      await sleep(1500);
+      const after = await readProgress("本视频结束，", { expectAbove: before });
+      if (after.done !== null && before !== null && after.done <= before) {
+        nochange++;
+        log(`注意：任务点数没有增长（${before} → ${after.done}），累计 ${nochange} 次`);
+        if (nochange >= 3) throw new Stop(5, "连续 3 个视频播完任务点数不涨，停止排查");
+      } else if (after.done !== null) {
+        nochange = 0;
+      }
+      break;
+    }
+    if (!handled) { log("本轮没有可播的视频节点，退出循环"); break; }
+    if (outOfTime()) break;
+  }
+
+  saveState({ phase: "done" });
+  log(`=== 结束：本次播放 ${played} 个视频，任务点 ${state.completedPoints}/${state.totalPoints}，耗时 ${elapsedMin()} 分钟 ===`);
+  return 0;
+}
+
+let exitCode = 0;
+try {
+  exitCode = await main();
+} catch (e) {
+  if (e instanceof Stop) {
+    exitCode = e.code;
+    if (e.code === 0) log("按预算时间正常退出");
+    else log(`【停止】${e.reason}（退出码 ${e.code}）`);
+    saveState({ phase: e.code === 0 ? "stopped" : "stopped", stopReason: e.reason, exitCode: e.code });
+    // 5/6 = 需要人介入：把最后一屏写进 STOPPED，让上层（和看门狗）一眼看到现场
+    if (e.code === 5 || e.code === 6) {
+      const ev = state.lastScreen || {};
+      const txt = [
+        `${e.reason}（退出码 ${e.code}）`,
+        `最后一屏：title=${ev.title || "(空)"} url=${ev.url || "(空)"}`,
+        `可见文字：${(ev.text || "(空)").slice(0, 200)}`,
+        `截图：${ev.screenshot || "(无)"}`,
+        ts(),
+      ].join("\n");
+      try { fs.writeFileSync(path.join(OUT_DIR, "STOPPED"), txt + "\n"); log("已写 STOPPED（含最后一屏）"); }
+      catch (err) { log("写 STOPPED 失败：" + err.message); }
+    }
+  } else {
+    exitCode = 1;
+    log(`【错误】${e && e.message ? e.message : e}`);
+    saveState({ phase: "error", stopReason: String(e && e.message ? e.message : e) });
+  }
+} finally {
+  cdp.close();
+  try { cli(["close"], 30); log("已关闭标签页"); } catch (e) { log("关闭标签页失败：" + e.message); }
+  process.exit(exitCode);
+}

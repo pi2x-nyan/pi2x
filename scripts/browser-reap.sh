@@ -39,10 +39,20 @@ mains=$(ps -eo pid,args 2>/dev/null | grep -a "chrome-linux-arm64" | grep -a "re
 
 now=$(date +%s)
 
-# ── ① 闲置判定：profile 最后活动时间 ────────────────────────────────────
+# 【2026-11-03 修】挂课专用实例（:9333 / profile=tmp/mooc/profile）不能被当成“闲置”杀掉。
+# 事故：挂课跑着的时候 admin/op 两个 profile 的 History 早就不动了，闲置闸一直触发，
+# 每 10 分钟 cron 就 pkill 一次，把正在播视频的挂课 Chrome 一起杀了（13:20:03 / 16:00:02 两次）；
+# 端口一空，browser-cli 又自己补一只 browser-profile-op 的 Chrome（about:blank），
+# runner 看到 0 个 video 就报“video 元素消失”。
+MOOC_PROFILE=$ROOT/tmp/mooc/profile
+mooc_busy=0
+if pgrep -f "mooc-loop\.sh" >/dev/null 2>&1 || pgrep -f "mooc-runner\.mjs" >/dev/null 2>&1; then mooc_busy=1; fi
+
+# ── ① 闲置判定：profile 最后活动时间（挂课专用 profile 算作“有人在用”）────────
 newest=0
 for f in "$ROOT/private/browser-profile/Default/History" "$ROOT/private/browser-profile/Default/Cookies" \
-         "$ROOT/private/browser-profile-op/Default/History" "$ROOT/private/browser-profile-op/Default/Cookies"; do
+         "$ROOT/private/browser-profile-op/Default/History" "$ROOT/private/browser-profile-op/Default/Cookies" \
+         "$MOOC_PROFILE/Default/History" "$MOOC_PROFILE/Default/Cookies"; do
   [ -f "$f" ] || continue
   t=$(stat -c %Y "$f" 2>/dev/null || echo 0)
   [ "$t" -gt "$newest" ] && newest=$t
@@ -63,16 +73,41 @@ reason=""
 [ "$oldest_min" -gt "$MAX_AGE_MIN" ] && reason="${reason:+$reason；}存活 ${oldest_min} 分钟（> ${MAX_AGE_MIN}）"
 [ -z "$reason" ] && exit 0   # 两闸都没触发 → 有人在用，别动
 
+# ── ③ 逐个实例筛：挂课专用的（以及 tmp 下的临时 profile）在挂课跑着时不碰 ──
+targets=""
+for p in $mains; do
+  prof=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -o -- '--user-data-dir=[^ ]*' | head -1 | cut -d= -f2-)
+  if [ "$mooc_busy" -eq 1 ]; then
+    case "$prof" in
+      "$MOOC_PROFILE"|"$ROOT"/tmp/*) continue ;;   # 挂课在跑：专用/临时 profile 一律不碰
+    esac
+  fi
+  targets="$targets $p"
+done
+if [ -z "$targets" ]; then exit 0; fi   # 只剩挂课实例 → 不动
+
+n_target=$(echo $targets | wc -w)
 n_proc=$(ps -eo args 2>/dev/null | grep -ac "chrome-linux-arm64")
 if [ "$DRY" -eq 1 ]; then
-  log "（干跑）应回收：$reason —— Chrome 实例 $(echo "$mains" | wc -l) 棵 / 进程 $n_proc 个"
+  log "（干跑）应回收：$reason —— 可回收实例 $n_target 棵 / 进程 $n_proc 个（保留挂课实例）"
   exit 0
 fi
 
-log "回收 Chrome：$reason —— 杀掉 $(echo "$mains" | wc -l) 棵实例 / $n_proc 个进程"
-pkill -TERM -f "chrome-linux-arm64" 2>/dev/null
+# 按进程组杀，避免 pkill -f 把保留的实例一起带走
+log "回收 Chrome：$reason —— 杀掉 $n_target 棵实例（保留挂课/临时 profile）/ 进程 $n_proc 个"
+for p in $targets; do
+  pg=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
+  [ -n "$pg" ] && kill -TERM -- "-$pg" 2>/dev/null
+  kill -TERM -- "$p" 2>/dev/null
+done
 sleep 4
-pkill -9 -f "chrome-linux-arm64" 2>/dev/null
+for p in $targets; do
+  if [ -d "/proc/$p" ]; then
+    pg=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
+    [ -n "$pg" ] && kill -9 -- "-$pg" 2>/dev/null
+    kill -9 -- "$p" 2>/dev/null
+  fi
+done
 sleep 2
 left=$(ps -eo args 2>/dev/null | grep -ac "chrome-linux-arm64")
 log "回收完成，残余 $left 个（技能下次使用时自动重启）"

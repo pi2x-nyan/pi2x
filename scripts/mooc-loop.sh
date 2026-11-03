@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# mooc-loop.sh —— 超星挂课外层循环（长时间连续跑）
+#
+# 每轮：node mooc-runner.mjs --minutes 100 --port 9333
+#   退出码 0（时间预算到）或 2（browser-cli 看门狗超时）→ 等 60s 跑下一轮
+#   退出码 3（验证码/异常）或 4（进度停滞卡住）→ 停止，写 tmp/mooc/STOPPED
+#   其它退出码 → 也停止并写 STOPPED（含真实退出码）
+#
+# 独立浏览器：先确保 :9333（profile=tmp/mooc/profile）在跑，绝不使用 9222。
+#
+# 用法：nohup bash <PI2X_ROOT>/scripts/mooc-loop.sh >> <PI2X_ROOT>/tmp/mooc/loop.nohup 2>&1 &
+set -u
+
+OUT=<PI2X_ROOT>/tmp/mooc
+RUNNER=<PI2X_ROOT>/scripts/mooc-runner.mjs
+CHROME_SH=$OUT/start-chrome.sh
+PORT=9333
+LOG=$OUT/loop.log
+STOP=$OUT/STOPPED
+LOCK=$OUT/loop.lock
+STATE=$OUT/state.json
+
+mkdir -p "$OUT"
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
+
+# 单实例保护
+if [ -f "$LOCK" ]; then
+  oldpid=$(cat "$LOCK" 2>/dev/null || true)
+  if [ -n "${oldpid:-}" ] && kill -0 "$oldpid" 2>/dev/null; then
+    log "已有 loop 在跑（pid=$oldpid），本次退出"
+    exit 0
+  fi
+fi
+echo $$ > "$LOCK"
+trap 'log "loop 收到终止信号，退出"; rm -f "$LOCK"; exit 143' INT TERM
+
+log "===== mooc-loop 启动 pid=$$ port=$PORT ====="
+round=0
+
+while :; do
+  round=$((round + 1))
+  started=$(date +%s)
+  log "--- 第 $round 轮开始（--minutes 100 --port $PORT）---"
+
+  if ! bash "$CHROME_SH" >> "$LOG" 2>&1; then
+    log "警告：独立 Chrome（:$PORT）未能确认就绪，仍尝试开跑"
+  fi
+
+  node "$RUNNER" --minutes 100 --port "$PORT" >> "$OUT/runner.out" 2>&1
+  code=$?
+  dur=$(( $(date +%s) - started ))
+  log "第 $round 轮结束：退出码 $code，耗时 ${dur}s"
+
+  case "$code" in
+    0|2)
+      # 全部任务点做完就没必要继续转了
+      done_pts=$(node -e 'try{const s=require("<PI2X_ROOT>/tmp/mooc/state.json");process.stdout.write(String(s.completedPoints)+"/"+String(s.totalPoints))}catch(e){process.stdout.write("-/-")}' 2>/dev/null)
+      case "$done_pts" in
+        "96/96")
+          echo "全部任务点已完成（96/96），$(ts)" > "$STOP"
+          log "【结束】全部任务点已完成，写 $STOP"
+          break
+          ;;
+      esac
+      log "等 60 秒后开始下一轮（当前进度 $done_pts）"
+      sleep 60
+      ;;
+    3)
+      echo "验证码/风控异常（退出码 3），$(ts)" > "$STOP"
+      log "【停止】验证码/异常，已写 $STOP"
+      break
+      ;;
+    4)
+      echo "进度停滞/卡住（退出码 4），$(ts)" > "$STOP"
+      log "【停止】进度停滞判定卡住，已写 $STOP"
+      break
+      ;;
+    5|6)
+      # 5=连续自愈失败 / 6=掉线，runner 已把最后一屏写进 STOPPED，别覆盖
+      log "【停止】退出码 $code，已写 $STOP（含最后一屏），等人处理"
+      break
+      ;;
+    *)
+      echo "异常退出码 $code，$(ts)" > "$STOP"
+      log "【停止】异常退出码 $code，已写 $STOP"
+      break
+      ;;
+  esac
+done
+
+rm -f "$LOCK"
+log "===== mooc-loop 结束（共 $round 轮）====="
