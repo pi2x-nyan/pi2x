@@ -18,13 +18,13 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { ROOT, LOGS_DIR, config } from "./lib/config.mjs";
+import { ROOT, LOGS_DIR, STATE_DIR, config } from "./lib/config.mjs";
 import { createLogger } from "./lib/log.mjs";
 import { readMode, writeMode, touchHeartbeat, DEFAULTS } from "./lib/mode.mjs";
 import { SafeSentry } from "./lib/safe/sentry.mjs";
 
 const logSafe = createLogger("safe");
-const STATE_DIR = path.join(ROOT, "state");
+// STATE_DIR 由 config.mjs 统一导出（private/state 优先，否则旧布局）
 
 async function main() {
   fs.mkdirSync(LOGS_DIR, { recursive: true });

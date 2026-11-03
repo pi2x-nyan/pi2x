@@ -3,6 +3,11 @@
 # 重启策略：先 SIGTERM 让代理优雅收尾（等在途流式请求结束），避免打断下游请求造成 502。
 # 注：pkill 用 [c] 括号写法，避免匹配到本脚本自身命令行。
 PATTERN="[c]ommandcode-proxy"
+# 日志目录随 private/ 布局变动，统一走 private-paths.sh（否则会写到不存在的 logs/ 而静默失败）
+. "$(dirname "$0")/private-paths.sh"
+LOG_FILE="${P_LOGS_DIR}/cc-go-proxy.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+export LOG_FILE   # 必须 export：下面 screen 里的单引号命令要靠环境变量展开它
 
 if pgrep -f "$PATTERN" >/dev/null 2>&1; then
   echo "旧代理在运行，发送 SIGTERM 优雅退出…"
@@ -21,7 +26,7 @@ if pgrep -f "$PATTERN" >/dev/null 2>&1; then
 fi
 
 screen -wipe >/dev/null 2>&1
-screen -dmS ccgo bash -c 'source /etc/profile.d/cred.sh 2>/dev/null; cd <PI2X_ROOT> && exec node scripts/commandcode-proxy.mjs >> logs/cc-go-proxy.log 2>&1'
+screen -dmS ccgo bash -c 'export COMMANDCODE_DNS_ORDER=ipv4first; source /etc/profile.d/cred.sh 2>/dev/null; cd <PI2X_ROOT> && exec node scripts/commandcode-proxy.mjs >> "$LOG_FILE" 2>&1'
 sleep 3
 echo "ccgo pid: $(pgrep -f "$PATTERN" | head -1)"
 echo "curl: $(curl -s -m 12 -o /dev/null -w '%{http_code}' http://127.0.0.1:20228/v1/models)"

@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head><title>Vulnerable Demo App</title></head>
+<body>
+<h1>Demo Application</h1>
+<!-- TODO: remove debug endpoint before prod -->
+<form action="/login.php" method="post">
+  <input name="username"><input name="password" type="password">
+  <button>Login</button>
+</form>
+<a href="/admin.php">Admin Panel</a>
+<a href="/api/v1/users">Users API</a>
+<a href="/backup.sql">Backup</a>
+</body>
+</html>

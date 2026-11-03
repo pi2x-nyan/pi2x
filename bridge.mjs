@@ -10,14 +10,19 @@
  * 用法：node bridge.mjs
  */
 import fs from "node:fs";
+import { proactiveConfig, loadState, shouldRun, recordSent, recordSkip } from "./lib/proactive.mjs";
+import { loadEvents, markConsumed, loadWatch, checkFiles, checkUrls } from "./lib/events.mjs";
+import { drainNotes, requeueNotes } from "./lib/notes.mjs";
+import { buildTrigger, strengthOf, appendDisposition } from "./lib/trigger.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ensureOnebotConfig, start, waitForReady, stop, isRunning } from "./lib/napcat.mjs";
 import { QQBridge } from "./lib/qqbridge.mjs";
 import { createPiAgent } from "./lib/piagent.mjs";
+import * as sst from "./lib/strix-session.mjs";
 import { createLogger } from "./lib/log.mjs";
-import { ROOT, STATE_DIR, config } from "./lib/config.mjs";
+import { ROOT, STATE_DIR, WORKSPACE, config } from "./lib/config.mjs";
 import { touchHeartbeat } from "./lib/mode.mjs";
 
 /* 各子系统日志器（scope 决定日志标签，取代原先手写的 "[xxx] " 前缀） */
@@ -32,6 +37,9 @@ const logRecv = createLogger("recv");
 const logReply = createLogger("reply");
 const logErr = createLogger("error");
 const logShutdown = createLogger("shutdown");
+/* strix 框架会话的收发日志（与 pi 主链路分开，排查时一眼能分辨走的是哪个框架） */
+const logSxRecv = createLogger("strix-recv");
+const logSxErr = createLogger("strix-error");
 
 // ---------- 图片处理辅助 ----------
 /**
@@ -49,7 +57,19 @@ const logShutdown = createLogger("shutdown");
  * @param {string} rawText extractText 的结果（含 `[转发 id:...]`）
  * @returns {Promise<string>} 替换后的文本
  */
-async function expandForward(bridge, message, rawText) {
+/**
+ * 展开合并转发，并把里面的图一并抽出来挂到 ev._forwardImages。
+ *
+ * 【为什么要把图挂到 ev 上】转发正文会被渲染成文本（图的位置只剩「[图片]」占位符），
+ * 图本身如果不单独带出来，collectImages 永远看不到 —— 模型就一直「看不见图」。
+ * 挂 ev 上是最小侵入的传递方式：下游 collectImages 持有 ev 引用，可直接取。
+ *
+ * @param {object} bridge
+ * @param {any[]} message 原始消息段数组
+ * @param {string} rawText 渲成文本后的消息
+ * @param {object} [ev] OneBot 事件对象（写入 _forwardImages）
+ */
+async function expandForward(bridge, message, rawText, ev) {
   const seg = (Array.isArray(message) ? message : []).find((s) => s.type === "forward" || s.type === "json" || s.type === "xml");
   const idMatch = /\[转发 id:([^\]]+)\]/.exec(rawText);
   const fid = idMatch?.[1] ?? seg?.data?.id ?? seg?.data?.message_id ?? "";
@@ -58,7 +78,9 @@ async function expandForward(bridge, message, rawText) {
     const res = await bridge.getForwardMsg(fid);
     const items = QQBridge.parseForwardMessages(res);
     const block = QQBridge.renderForward(items);
-    logMerge.info(`展开合并转发 id=${fid} · ${items.length} 条`);
+    const imgs = items.flatMap((it) => it.images ?? []);
+    if (ev && imgs.length) ev._forwardImages = imgs;
+    logMerge.info(`展开合并转发 id=${fid} · ${items.length} 条${imgs.length ? ` · 含 ${imgs.length} 张图` : ""}`);
     return rawText.replace(/\[转发[^\]]*\]/, block);
   } catch (e) {
     logMerge.warn(`展开合并转发失败 id=${fid}: ${e?.message}`);
@@ -80,10 +102,11 @@ function detectMime(buf) {
   return null;
 }
 
-/** 收集消息中的图片 → SDK ImageContent[] {type:'image', data(base64), mimeType} */
-async function collectImages(ev, bridge) {
-  const parts = QQBridge.extractImages(ev.message);
-  if (!parts.length) return [];
+/** 把一组图片引用落成 SDK ImageContent[]（失败逐个降级，不抛）
+ * @param {object[]} parts 图片段 data（{file,url,...}）
+ * @param {object} bridge QQBridge 实例
+ * @returns {Promise<Array<{type:'image',data:string,mimeType:string}>>} */
+async function fetchImageParts(parts, bridge) {
   const out = [];
   for (const img of parts) {
     try {
@@ -102,18 +125,20 @@ async function collectImages(ev, bridge) {
       }
       // 2) URL 下载兑底
       if (!buf && img.url) {
-        const resp = await fetch(img.url);
-        if (resp.ok) {
-          const ab = await resp.arrayBuffer();
-          if (ab.byteLength <= MAX_IMAGE_BYTES) { buf = Buffer.from(ab); name = img.url; }
-        }
+        try {
+          const resp = await fetch(img.url);
+          if (resp.ok) {
+            const ab = await resp.arrayBuffer();
+            if (ab.byteLength <= MAX_IMAGE_BYTES) { buf = Buffer.from(ab); name = img.url; }
+          }
+        } catch { /* 下面统一报 */ }
       }
       if (buf) {
         const mimeType = detectMime(buf) ?? "image/png";
         out.push({ type: "image", data: buf.toString("base64"), mimeType });
         logImg.info(`已收集图片 ${name.slice(-40)} (${buf.length} 字节, ${mimeType})`);
       } else {
-        logImg.warn("图片获取失败（超大小或无路径/URL）");
+        logImg.warn(`图片获取失败（超大小或无路径/URL）file=${String(img.file ?? "").slice(-30)}`);
       }
     } catch (e) {
       logImg.warn(`图片获取失败: ${e?.message}`);
@@ -122,8 +147,43 @@ async function collectImages(ev, bridge) {
   return out;
 }
 
+/** 收集消息中的图片 → SDK ImageContent[] {type:'image', data(base64), mimeType}
+ *
+ * 【为什么要收引用与转发里的图】旧实现只扫顶层 image 段，于是：
+ *   · 群里引用一条图片消息再 @bot → 图在 reply 段里，抓不到；
+ *   · 转发一整个聊天记录 → 里面的图只以「[图片]」占位符出现在正文。
+ * 模型收到的是占位符，就变成了「我看不见图」——这正是 RA 反馈的现场。
+ *
+ * 现在：顶层图 + 引用消息里的图 + 合并转发里的图 一起收。
+ * 顺序与正文中出现的次序一致（引用图在前，转发图在后），方便模型对应
+ * renderForward 里打出的 <图片 N> 标号。
+ */
+async function collectImages(ev, bridge) {
+  const refs = [];
+
+  // ① 顶层图片（原有行为）
+  refs.push(...QQBridge.extractImages(ev.message));
+
+  // ② 引用消息里带的图（reply 段可能内联了被引用消息的 message 结构）
+  for (const seg of Array.isArray(ev.message) ? ev.message : []) {
+    if (seg?.type === "reply" && seg.data) {
+      const nested = QQBridge.collectImageRefs(seg.data.message ?? seg.data.content ?? []);
+      if (nested.length) refs.push(...nested);
+    }
+  }
+
+  // ③ 合并转发里的图（expandForward 已把它们抽好存在 ev._forwardImages）
+  if (Array.isArray(ev._forwardImages) && ev._forwardImages.length) {
+    refs.push(...ev._forwardImages);
+    logImg.info(`转发消息内附带 ${ev._forwardImages.length} 张图，一并收集`);
+  }
+
+  if (!refs.length) return [];
+  return fetchImageParts(refs, bridge);
+}
+
 // ---------- 文件接收辅助（非图片文件 → 落地到 workspace/downloads/） ----------
-const DOWNLOAD_DIR = path.join(ROOT, "workspace", "downloads");
+const DOWNLOAD_DIR = path.join(WORKSPACE, "downloads");
 const MAX_FILE_BYTES = 60 * 1024 * 1024; // 单文件上限 60MB
 
 /** 收集消息中的文件段 → 落地本地，返回 [{name, path, size, url}] */
@@ -214,10 +274,25 @@ const nb = config.napcat.onebot;
 const bridge = new QQBridge({ host: nb.wsHost, port: nb.wsPort, token: nb.token });
 await bridge.connect();
 
+// ---------- 3.9 会话活跃时间（供主动回合判定） ----------
+const _lastUserMsgAt = new Map();
+
 // ---------- 4. pi agent ----------
 const pi = createPiAgent({ bridge });
 await pi.init();
 logBoot.info("pi agent 就绪，PI2X 开始工作");
+
+// ---------- 4.2 strix 孤儿清扫 ----------
+// strix 常驻会话是独立子进程，不会随 bridge 一起被系统带走。上一轮如果被
+// kill -9 / OOM（watchdog 重启、掉电），那些 worker 就变成孤儿进程，带着一整套
+// strix agent 和 headless Chrome 白跑（烧钱 + 占着会话目录）。启动瞬间不可能有
+//「属于当前进程」的 worker，所以这里看到的全是孤儿，直接杀。
+try {
+  const n = sst.sweepStrixOrphans();
+  if (n) logBoot.warn(`清理 ${n} 个残留的 strix 会话进程（上次未正常退出）`);
+} catch (e) {
+  logBoot.warn(`strix 孤儿清扫失败（不影响启动）：${e?.message}`);
+}
 
 // ---------- 4.5 心跳 ----------
 // 供看门狗（scripts/watchdog.mjs，由 cron 调用）判断「正常模式是否还活着」。
@@ -237,6 +312,95 @@ logBoot.info("pi agent 就绪，PI2X 开始工作");
   hb.unref?.();
   process.on("SIGTERM", () => clearInterval(hb));
   logBoot.info(`心跳已启动（每 ${Math.round(intervalMs / 1000)} 秒）`);
+}
+
+// ---------- 4.7 主动回合（proactive） ----------
+// 与 4.5 的「生命周期心跳」不是一回事：那个只写 token 给看门狗；
+// 这个是让 agent 周期性自检「有没有该主动说的事」。
+// 默认关闭，配置在 config.pi.proactive；四道闸（静默时段/冷却/每日上限/用户活跃）在 lib/proactive.mjs。
+{
+  const pcfg = proactiveConfig(config.pi?.proactive);
+  if (!pcfg.enabled) {
+    logBoot.info("主动回合：未启用（config.pi.proactive.enabled=false）");
+  } else {
+    const tick = async () => {
+      try {
+        const st = loadState();
+        // 先跑一次事件源巡检（文件 mtime / 网页 hash），把它们变成事件入队
+        try {
+          const w = loadWatch();
+          if ((w.files ?? []).length) checkFiles(w);
+          if ((w.urls ?? []).length) await checkUrls(w);
+        } catch (e) { logBoot.warn(`事件源巡检失败：${e?.message}`); }
+        const pending = loadEvents();
+        for (const chatKey of pcfg.chats) {
+          const [chatType, targetId] = String(chatKey).split(":");
+          const verdict = shouldRun({
+            cfg: pcfg, state: st, chatKey, now: Date.now(),
+            lastUserMsgAt: _lastUserMsgAt.get(chatKey) ?? 0,
+          });
+          // 事件是新信息：可以绕过「冷却」，但静默时段/每日上限/用户活跃三道闸仍然生效
+          const isEventTurn = pending.length > 0;
+          let reason = verdict.reason;
+          let run = verdict.run;
+          if (!run && isEventTurn && reason === "cooldown") { run = true; reason = "event-bypass-cooldown"; }
+          if (!run) continue;
+          logBoot.info(`主动回合触发：${chatKey}（${reason}${isEventTurn ? " · 事件" : ""}）`);
+          const uid = String(targetId);
+          const r = await pi.runProactiveTurn({
+            chatKey, chatType, targetId: uid, userId: uid,
+            events: isEventTurn ? pending : null,
+          });
+          if (r.skip) {
+            // 模型判断“不值得说”的事件也要消费掉，否则它每分钟都会再触发一次
+            if (isEventTurn) markConsumed(pending.map((e) => e.key || e.id));
+            recordSkip({ state: st, chatKey });
+            logBoot.info(`主动回合：未发言（${r.reason ?? "skip"}）`);
+            continue;
+          }
+          // 发送与留痕都在 runProactiveTurn 里做（先发后记），这里只记状态
+          recordSent({ state: st, chatKey });
+          if (isEventTurn) markConsumed(pending.map((e) => e.key || e.id));
+          logBoot.info(`主动回合已发送：${chatKey}（${r.text.length} 字）`);
+        }
+      } catch (e) {
+        logBoot.warn(`主动回合异常：${e?.message}`);
+      }
+    };
+    const t = setInterval(tick, 60_000);
+    t.unref?.();
+    process.on("SIGTERM", () => clearInterval(t));
+    logBoot.info(`主动回合已启动：${pcfg.chats.join(",") || "(无会话)"}，间隔 ${pcfg.intervalMinutes} 分钟，每日上限 ${pcfg.dailyMax}`);
+  }
+}
+
+// ---------- 4.8 系统消息留痕（提醒等） ----------
+// 提醒是 cron 直接发的，会话里没有记录；不补的话，用户回「看到了」我不知道在说什么。
+// 每 30 秒扫一次便条队列，用 bridge 自己的句柄写进对应会话，避免两个进程抢同一个文件。
+{
+  const tick = async () => {
+    let notes = [];
+    try { notes = drainNotes(); } catch { return; }
+    if (!notes.length) return;
+    const failed = [];
+    for (const n of notes) {
+      // 群消息不落：群会话按用户隔离，一条群提醒没有明确的归属用户
+      if (n.chat !== "private") continue;
+      try {
+        const ok = await pi.recordSystemNote({ chatKey: `private:${n.target}`, userId: String(n.target), text: n.text, kind: n.kind ?? "reminder" });
+        if (!ok) failed.push(n);
+      } catch (e) {
+        logBoot.warn(`留痕异常：${e?.message}`);
+        failed.push(n);
+      }
+    }
+    if (failed.length) { try { requeueNotes(failed); } catch {} }
+  };
+  const t = setInterval(tick, 30_000);
+  t.unref?.();
+  process.on("SIGTERM", () => clearInterval(t));
+  setTimeout(tick, 8000); // 启动后先扫一次，把重启期间积压的补上
+  logBoot.info("系统消息留痕已启动（每 30 秒）");
 }
 
 // ---------- 4.6 闲置压缩巡检 ----------
@@ -353,6 +517,14 @@ function mergeFlush(chatKey) {
   // 合并文本：多条消息用换行分隔，并标注这是连续消息
   const joined = b.texts.map((t, i) => (b.texts.length > 1 ? `〔第${i + 1}条〕${t}` : t)).join("\n");
   logMerge.info(`${chatKey} 合并 ${b.texts.length} 条 → 提交`);
+  // 进了这一轮：记一条 accepted，和上面被筛掉的记录合起来就是完整处置链
+  try {
+    appendDisposition(path.join(STATE_DIR, "triggers.jsonl"), {
+      triggerId: b.trigger ? `qq-${b.trigger}` : `qq-batch-${Date.now()}`,
+      threadKey: `qq:${b.chatType}:${chatKey.split(":").pop()}`,
+      disposition: { evalId: chatKey, accepted: b.texts.length },
+    }, { append: (line) => fs.appendFileSync(path.join(STATE_DIR, "triggers.jsonl"), line, "utf8") });
+  } catch { /* 记账失败不影响回复 */ }
   _processNormal({
     chatKey,
     text: joined || b.texts[0] || "",
@@ -390,6 +562,25 @@ function mergeEnqueue({ chatKey, text, chatType, targetId, selfId, userName, use
 async function _processNormal({ chatKey, text, chatType, targetId, selfId, userName, userId, images, trigger, skipMemory, triggerType }) {
   const message_type = chatType === "group" ? "group" : "user";
   const _id = chatType === "group" ? Number(targetId) : Number(userId);
+
+  // ── strix 框架路由（仅 admin 私聊，已在 /strix 入口鉴权）────────────────
+  // 该会话已接入 strix 时，消息不再进 PI2X 主 agent，而是注入 strix 常驻会话。
+  // 【为什么放在 handleMessage 之前】切了框架就该真的换执行体，而不是把消息
+  // 同时喂给两边 —— 那会变成两个 agent 抢答，还可能各自重复动手。
+  //
+  // 【为什么这里还要再判一次私聊】切换入口已经拦了群聊，但路由是最后一道；
+  // 万一以后有别的路径建出了群里的实例（配置改动/热重载），也不能让渗透输出
+  // 落到群里。两道判断是有意重复的。
+  if (chatType !== "group") {
+    const sx = sst.peekStrixSession(String(userId), chatKey);
+    // `hasPending` 也要算进来：/strix new 是**懒启动**（只登记不拉进程），
+    // 用户的第一句话必须交给 strix 当任务，而不是被 PI2X 主 agent 抢去回答。
+    if (sx && (sx.alive || sx.hasPending)) {
+      await _processStrix({ sx, chatKey, text, chatType, targetId, userId, userName, images });
+      return;
+    }
+  }
+
   const reply = await pi.handleMessage({
     chatKey,
     text,
@@ -415,15 +606,90 @@ async function _processNormal({ chatKey, text, chatType, targetId, selfId, userN
   logSent.info(`${chatKey}: ${cleaned.replace(/\n/g, " ").slice(0, 60)}${parts.length > 1 ? ` (+${parts.length - 1}段)` : ""}`);
 }
 
+/** 把一条消息注入 strix 会话，并把它的输出分段发回 QQ。
+ *
+ * strix 一轮可能跑很久（分钟到小时）。这里**不阻塞在单次回复上**：
+ *   · 先立刻回一句「已收到，在跑」，把当前进度同步给用户
+ *   · 然后用 send() 收集直到本轮 park（agent 说完了/等人）
+ * 若本轮跑到 IDLE_GRACE_MS 还没结束，send() 会先把已有的输出交回来。
+ */
+async function _processStrix({ sx, chatKey, text, chatType, targetId, userId, userName, images }) {
+  const send = async (body) => {
+    if (!body) return;
+    const parts = splitReply(body, Number(config.pi.maxReplyChars) || 1500);
+    for (const part of parts.slice(0, 8)) {
+      if (chatType === "group") await bridge.sendGroupMsg(Number(targetId), part);
+      else await bridge.sendPrivateMsg(Number(userId), part);
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  };
+
+  if (images?.length) {
+    logSxRecv.warn(`${chatKey}: strix 模式暂不支持图片输入，已忽略 ${images.length} 张`);
+  }
+
+  logSxRecv.info(`${chatKey} <${userName}>: ${String(text).slice(0, 80)}`);
+  try {
+    const r = await sx.send(text);
+    const body = r.text || "（strix 本轮没有输出；可用 /strix status 看状态）";
+    const tail = r.costUsd != null ? `\n\n· strix 累计 $${Number(r.costUsd).toFixed(4)}` : "";
+    await send(body);
+    if (tail) await send(tail.trim());
+    logSent.info(`${chatKey}[strix]: ${body.replace(/\n/g, " ").slice(0, 60)}`);
+  } catch (e) {
+    logSxErr.error(`strix 执行失败: ${e?.message}`);
+    await send(`strix 执行失败：${e?.message}\n可试 /strix status 看状态，或 /pi2x 先退回主框架。`);
+  }
+}
+
 bridge.on("event", async (ev) => {
   if (ev.post_type !== "message") return;
   if (isDuplicate(ev.message_id)) return;
 
   const { message_type, user_id, group_id, self_id, message, message_id } = ev;
   const rawText0 = QQBridge.extractText(message).trim();
+
+  // 【Trigger 记账】借鉴 dsh-superagent：每条进来的消息先落成结构化 Trigger，
+  // 再记一条 disposition（进了哪一轮 / 为什么没进）。只追加不改写，
+  // 目的是事后能回答「这条为什么不回」「这条归哪个任务」——以前全靠翻日志猜。
+  const trgPath = path.join(STATE_DIR, "triggers.jsonl");
+  const mkTrigger = (mentionsMe) => buildTrigger({
+    id: `qq-${message_id}`,
+    chatType: message_type,
+    chatId: message_type === "group" ? group_id : user_id,
+    userId: user_id,
+    userName: ev.sender?.card || ev.sender?.nickname,
+    text: rawText0,
+    mentionsMe,
+    isBot: String(user_id) === String(self_id),
+    at: new Date().toISOString(),
+  });
+  const note = (trigger, disposition) => {
+    try { appendDisposition(trgPath, { triggerId: trigger.id, threadKey: trigger.threadKey, disposition }, { fs }); }
+    catch { /* 记账失败不影响主流程 */ }
+  };
+
+  // 【群聊屏蔽 @全体成员】
+  // @全体成员 是面向全群的公告，语义上不是「叫 bot」；旧的 isMentioned 把 qq==="all"
+  // 也算命中，导致任何一条群公告都会把 bot 从潜水里拽醒、白烧一遍 token。
+  // 按用户要求：这类消息**整条忽略**（不进模型、不回复、不拉引用全文、不展开转发）。
+  // 唯一后门：消息**另外单独 @ 了 bot 本人**时仍放行 —— 那是明确指向。
+  // 放在这个位置（解析引用/转发之前）是故意的 —— 让被屏蔽的消息连网络请求都不发出去。
+  // 判定本身在 QQBridge.shouldIgnoreAtAll（纯函数，可单测）。
+  if (message_type === "group" && config.permissions?.ignoreAtAll !== false) {
+    if (QQBridge.shouldIgnoreAtAll(message, self_id, rawText0)) {
+      logRecv.info(
+        `忽略 @全体成员 消息（群 ${group_id} / ${ev.sender?.card || ev.sender?.nickname || user_id}）: ${rawText0.slice(0, 60)}`,
+      );
+      const t0 = mkTrigger(true);
+      note(t0, { filtered: { code: "at_all" }, strength: "none" });
+      return;
+    }
+  }
   // 引用全文增强：reply 段带 id → get_msg 拉被引用消息全文（失败则保留段内自带预览）
   // 注：extractText 产出的标记是 [引用…]（NapCat reply 段只给 id，不含文本，必须 get_msg 拉全文）
   let rawText = rawText0;
+  let quotedFromSelf = false;   // 这条消息是不是在引用我自己发的东西
   // 顶层 message 里直接带 forward 段 → 这条消息本身就是一张聊天记录卡片（直接发的）；
   // 若 [转发 id:...] 只出现在引用块里（rawText 有 [引用 且顶层无 forward 段），
   // 则属于「引用了一条转发」，那种情况才展开。
@@ -443,6 +709,8 @@ bridge.on("event", async (ev) => {
         full = String(full).replace(/\[引用[^\]]*\]/g, "").trim();
         // 带出被引用者（昵称+QQ），便于模型知道“谁说的”
         const sd = r?.sender ?? r?.data?.sender ?? {};
+        // 被引用的是不是我自己：用于「这句话是在补给我的某个工单」的判定
+        if (sd.user_id != null && String(sd.user_id) === String(self_id)) quotedFromSelf = true;
         const who = String(sd.card || sd.nickname || "").trim();
         const uid = sd.user_id ? `(${sd.user_id})` : "";
         const head = who ? `${who}${uid}` : uid.replace(/[()]/g, "");
@@ -475,7 +743,7 @@ bridge.on("event", async (ev) => {
         "〔转发消息（群聊默认不展开；如需我看，请引用该条转发）〕",
       );
     } else {
-      rawText = await expandForward(bridge, message, rawText);
+      rawText = await expandForward(bridge, message, rawText, ev);
     }
   }
   if (!rawText) return;
@@ -483,14 +751,20 @@ bridge.on("event", async (ev) => {
   // 群聊：响应判定 = @bot（at 段/文本 @）或喊名字（消息任意位置含 PI2X/2X/机器人）；无指向消息一律潜水
   const atSeg = QQBridge.isMentioned(message, self_id);
   const nickM = rawText.match(/^@([^\s]+)\s*/); // 文本 @xxx
-  const textBot = nickM && (nickM[1] === String(self_id) || nickM[1] === "all" || nickM[1] === "PI2X" || nickM[1] === "2X");
+  // 注：这里**不再**把 nickM[1] === "all" 当唤醒条件 —— @全体成员 已在开头被整条忽略，
+  // 若这里还认 all，就等于给屏蔽开了个后门（文本 @all 仍会命中）。
+  const textBot = nickM && (nickM[1] === String(self_id) || nickM[1] === "PI2X" || nickM[1] === "2X");
   // 喊名字唤醒（借鉴大肥鸭：被@/喊名字才醒）
   const nameKeywords = config.permissions?.nameKeywords ?? ["pi2x", "2x", "机器人"];
   const nameRe = new RegExp("(" + nameKeywords.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")", "i");
   const hasName = nameRe.test(rawText);
   const triggerType = (atSeg || textBot) ? "@唤醒" : "名称唤醒";
   if (message_type === "group") {
-    if (!atSeg && !textBot && !hasName) return; // 无任何指向 → 潜水（冒泡功能已取消）
+    if (!atSeg && !textBot && !hasName) {
+      // 无任何指向 → 潜水（冒泡功能已取消）；记一条，方便日后查「这条为什么没被接」
+      note(mkTrigger(false), { filtered: { code: "not_addressed" }, strength: "none" });
+      return;
+    }
     if (!allowed("group", group_id)) return;
   } else {
     if (!allowed("user", user_id)) return;
@@ -499,6 +773,36 @@ bridge.on("event", async (ev) => {
   const chatKey = message_type === "group" ? `group:${group_id}` : `private:${user_id}`;
   const targetId = message_type === "group" ? String(group_id) : String(user_id);
   const userName = ev.sender?.card || ev.sender?.nickname || String(user_id);
+
+  // 【工单接力】人引用了我发的通知再说一句 → 这句话属于那个工单，递进去，不再另起一轮。
+  // 对应 dsh-superagent 的 follow-up ownership：消息在工单线程上，就归那个 Executor 处理。
+  // 默认关闭（config.pi.superagent.followupRouting），因为一旦误判，用户会觉得"我说的话没人理"。
+  if (quotedFromSelf && config.pi?.superagent?.followupRouting) {
+    try {
+      const rt = pi?.tickets;
+      const live = rt ? rt.store.live().filter((t) => t.chatKey === `qq:${chatKey}`) : [];
+      const t = live[live.length - 1];
+      if (t) {
+        rt.attachInput(t.id, { human: true, text: rawText, triggerId: `qq-${message_id}` });
+        const task = [...(pi._subTasks?.values?.() ?? [])].find((x) => x.ticketId === t.id && (x.status === "running" || x.status === "pending"));
+        if (task) {
+          // worker 还活着：这句话直接递进去（attach），不再另起一轮
+          await pi._subSteer(task, rawText).catch(() => {});
+          rt.recordDecision({ triggerId: `qq-${message_id}`, action: "attach", ticketId: t.id, chatKey: `qq:${chatKey}`, reason: "live_worker" });
+          logRecv.info(`${chatKey} 工单接力 → ${t.id}（attach 到在跑的 worker）`);
+        } else {
+          // worker 已经收工：这句话等于让它接着干（requeue）
+          const r = await pi._requeueTicket(t.id, rawText);
+          rt.recordDecision({ triggerId: `qq-${message_id}`, action: r.ok ? "requeue" : "attach", ticketId: t.id, chatKey: `qq:${chatKey}`, reason: r.ok ? "resume" : "no_ticket" });
+          logRecv.info(`${chatKey} 工单接力 → ${t.id}（${r.ok ? `requeue 续跑 ${r.taskId}` : "仅记账"}）`);
+        }
+        note(mkTrigger(true), { fanout: [t.id], via: "followup" });
+        return;   // 不再进入普通回合
+      }
+    } catch (e) {
+      logRecv.warn(`工单接力失败，回退到普通回合: ${e?.message}`);
+    }
+  }
 
   // 剥离开头的 @bot（at 段文本或 @昵称），使其后的 $ / > 可命中命令路由
   let text = textBot ? rawText.slice(nickM[0].length) : rawText;
@@ -548,6 +852,8 @@ bridge.on("event", async (ev) => {
     }
 
     const images = await collectImages(ev, bridge);
+    // 记录会话活跃时间（主动回合据此判断「用户刚说完话就别插嘴」）
+    try { _lastUserMsgAt.set(chatKey, Date.now()); } catch {}
     const files = await collectFiles(ev, bridge);
     // 若收到文件，把落地路径告知 AI（文件消息不合并，立即处理）
     if (files.length) {
@@ -580,6 +886,8 @@ bridge.on("event", async (ev) => {
 async function shutdown(reason) {
   logShutdown.info(reason);
   try { await pi.disposeAll(); } catch {}
+  // strix 常驻会话也要收掉：它们是独立子进程，不随 bridge 进程退出
+  try { await sst.disposeAllStrix(); } catch {}
   bridge.close();
   stop();
   process.exit(0);

@@ -10,6 +10,7 @@
  *   node scripts/memory-cli.mjs warm            # 预热 embedding 模型（部署后跑一次）
  */
 import fs from "node:fs";
+import { CONFIG_PATH, WHITELIST_PATH } from "../lib/config.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMemoryStore } from "../lib/memory.mjs";
@@ -19,7 +20,7 @@ function Base64Id(content) {
 }
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const config = JSON.parse(fs.readFileSync(path.join(ROOT, "config.json"), "utf8"));
+const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
 const m = config.memory ?? {};
 const dbPath = path.resolve(ROOT, m.dbPath ?? "./workspace/memories/memory.db");
 

@@ -336,11 +336,40 @@ test("重启锁：时间戳必须按毫秒解读（秒级会误判成过期 56 �
 
 test("restart-pi2x.sh 写锁必须用毫秒（date +%s%3N）", () => {
   const src = fs.readFileSync(path.join(ROOT, "scripts/restart-pi2x.sh"), "utf8");
-  // 锚定赋值行本身（注释里也提到 restart.lock，不能拿它当锚点）
-  const i = src.indexOf('LOCK="$ROOT_DIR/state/restart.lock"');
+  // 【为何改锚点】私密目录改造后，锁路径从 "$ROOT_DIR/state/..." 变为
+  // "$STATE_DIR_S/restart.lock"（由 scripts/private-paths.sh 解析出实际位置）。
+  // 这里改为锚定「写锁的那一行」本身：形如 echo "$$ $(date +%s%3N)" > ".../restart.lock"
+  const i = src.indexOf('restart.lock"');
   assert.ok(i > 0, "找不到锁的写入点");
-  const seg = src.slice(i, i + 800);
+  const seg = src.slice(Math.max(0, i - 200), i + 800);
   assert.ok(seg.includes("date +%s%3N"), "必须用毫秒时间戳 date +%s%3N");
   const writeLine = seg.split("\n").find((l) => l.includes("> \"$LOCK\"")) ?? "";
   assert.ok(writeLine.includes("%3N"), `写锁那行必须带毫秒（实际：${writeLine.trim()}）`);
+});
+
+// ── 重启脚本：必须自我脱离父进程树 ──────────────────────────────────────────
+//
+// 【真实事故 2026-09-21 01:05】从 agent 的 bash 工具调用 restart-pi2x.sh：
+//   01:05:13.5 写完重启锁 → 01:05:14.7 bridge 被 pkill（脚本自己的动作）
+//   → 脚本作为 bridge 的**子孙进程**被进程树清理（SIGTERM→SIGKILL）一并杀掉
+//   → 永远走不到「拉起新进程」那一步（输出停在「已创建回滚点」，锁文件残留）
+//   → 2 分钟后看门狗兜底拉起，用户收到「🔧 被看门狗自动拉起」而非「已重启完成」。
+//
+// 修法：在任何有副作用的动作之前，先用 setsid 把自己挪进独立会话。
+// 这两条断言守住修复（含顺序：脱离必须发生在 pkill 之前）。
+test("restart-pi2x.sh 必须先自我脱离父进程树（setsid），否则会被连坐强杀", () => {
+  const src = fs.readFileSync(path.join(ROOT, "scripts/restart-pi2x.sh"), "utf8");
+  assert.match(src, /setsid/, "必须用 setsid 脱离父进程树（新 session + 新进程组）");
+  assert.match(src, /PI2X_RESTART_DETACHED/, "需要哨兵变量防止无限自我重入");
+
+  // 顺序：脱离段必须出现在 pkill bridge 之前 —— 否则被杀了才想脱身，已经晚了
+  const iDetach = src.indexOf("PI2X_RESTART_DETACHED");
+  const iPkill = src.indexOf("pkill -f 'bridge[.]mjs'");
+  assert.ok(iDetach > 0, "找不到自我脱离段");
+  assert.ok(iPkill > 0, "找不到 pkill 段");
+  assert.ok(iDetach < iPkill, "自我脱离必须排在 pkill 之前（先脱钩再动手）");
+
+  // 脱离段必须在「只读模式」之后：--print-target/--dry-run 不该被转成后台任务
+  const iReadonly = src.indexOf('echo "chat=$Chat target=$Target uid=$Uid"');
+  assert.ok(iReadonly > 0 && iReadonly < iDetach, "只读模式应先返回，不做脱离");
 });

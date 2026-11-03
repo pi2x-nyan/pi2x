@@ -16,7 +16,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { makeSettingsManager, SUMMARIZATION_RESERVE_TOKENS, KEEP_RECENT_TOKENS } from "../lib/agent/settings.mjs";
+import { makeSettingsManager, defaultThinkingLevel, SUMMARIZATION_RESERVE_TOKENS, KEEP_RECENT_TOKENS } from "../lib/agent/settings.mjs";
 
 /** pi 的默认 reserveTokens —— 低于此预算会触发上面的截断事故 */
 const PI_DEFAULT_RESERVE_TOKENS = 16384;
@@ -70,6 +70,38 @@ test("配置项可覆盖默认（config.json 的 pi.compactionReserveTokens 生�
   const s = makeSettingsManager().getCompactionSettings();
   assert.equal(s.reserveTokens, Number(config.pi.compactionReserveTokens ?? SUMMARIZATION_RESERVE_TOKENS));
   assert.equal(s.keepRecentTokens, Number(config.pi.compactionKeepRecentTokens ?? KEEP_RECENT_TOKENS));
+});
+
+/**
+ * 思考等级（thinking level）的回归测试。
+ *
+ * 背景（真实事故 2026-10-19）：上游 deepseek-v4.1-flash 是推理模型，
+ * `reasoning_content` 与 `content` 是两个独立字段。SDK 默认思考等级是 "medium"，
+ * 但本项目模型的 thinkingLevelMap 里 medium 是 null（不支持），会被 clamp 成 "high"；
+ * 思考预算不足时模型可能把整轮 token 全花在推理上、正文为空，
+ * 客户端收到「一个 delta 都没有」的空流，表现为「空回复」。
+ *
+ * 本测试锁死：默认思考等级必须来自 config.pi.thinkingLevel（默认 max），
+ * 且真的传递进了 SettingsManager。
+ */
+test("makeSettingsManager：思考等级来自 config.pi.thinkingLevel（默认 max）", () => {
+  const s = makeSettingsManager();
+  assert.equal(s.getDefaultThinkingLevel(), defaultThinkingLevel());
+  assert.equal(s.getDefaultThinkingLevel(), "max", "默认思考等级应为 max（防推理吃光预算导致正文为空）");
+});
+
+test("defaultThinkingLevel：config 缺省时回落到 max，不会被空值带偏", () => {
+  const v = defaultThinkingLevel();
+  assert.ok(typeof v === "string" && v.trim().length > 0, "思考等级不得为空串");
+  assert.ok(
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(v),
+    `思考等级 ${v} 不是 pi 认可的取值`,
+  );
+});
+
+test("makeSettingsManager：允许调用方覆盖思考等级", () => {
+  const s = makeSettingsManager({ defaultThinkingLevel: "low" });
+  assert.equal(s.getDefaultThinkingLevel(), "low", "显式覆盖未生效");
 });
 
 test("全仓库不得再出现裸的 SettingsManager.inMemory()（防止绕过统一设置）", async () => {

@@ -7,6 +7,7 @@
  *   - 正常返回 user_id → exit 0
  */
 import WebSocket from "ws";
+import { CONFIG_PATH, WHITELIST_PATH } from "../lib/config.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,7 +18,7 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
  *  token 绝不写默认值 —— 那等于把密钥焊进代码里（本文件曾犯过这个错）。 */
 function loadOnebot() {
   try {
-    const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, "config.json"), "utf8"));
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
     return cfg?.napcat?.onebot ?? {};
   } catch {
     return {};

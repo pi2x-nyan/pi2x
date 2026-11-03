@@ -18,12 +18,13 @@
  *   node scripts/qq-cli.mjs --as <uid> deop <targetUid>
  */
 import fs from "node:fs";
+import { CONFIG_PATH, WHITELIST_PATH } from "../lib/config.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const config = JSON.parse(fs.readFileSync(path.join(ROOT, "config.json"), "utf8"));
-const WHITELIST_FILE = path.join(ROOT, "whitelist.json");
+const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+const WHITELIST_FILE = WHITELIST_PATH;
 const { createWhitelist } = await import(path.join(ROOT, "lib", "whitelist.mjs"));
 const { QQBridge } = await import(path.join(ROOT, "lib", "qqbridge.mjs"));
 const { checkGrant, checkRevoke, levelOf, PRESET_LEVEL } = await import(path.join(ROOT, "lib", "op-policy.mjs"));
@@ -40,7 +41,8 @@ const [action, ...rest] = args;
 
 // ── 权限判定 ──
 const PERM = {
-  group_history: "tools.group_history",
+  // group_history 不在此列：它对所有人开放，权限改为「能不能跳出当前群」的动态判定，
+  // 见下方 resolveGroupHistoryTarget()。留一个 token 在这反而会让人误以为它还是拒绝的。
   msg_detail: "tools.get_msg",
   friend_list: "tools.friend_list",
   group_list: "tools.group_list",
@@ -62,6 +64,49 @@ function requirePerm(token) {
     console.log(`权限不足：${action} 需要「${token}」，当前用户 ${uid || "?"} 没有该权限。`);
     process.exit(1);
   }
+}
+
+/**
+ * 群聊记录：所有人都能用，但**非特权用户只能查自己当前所在的群**。
+ *
+ * 【为什么要加这层】group_history 一旦对所有人开放，若不加限制，任何 friend/dialog
+ * 用户只要说一句「查群 123456 的记录」就能把别人群的聊天记录整段拉走 —— 群聊记录
+ * 里什么都有（手机号、地址、私事），这是别人的隐私，不能因为「方便」就开成一把万能钥匙。
+ *
+ * 【「当前群」从哪来】qq-cli 是独立子进程，拿不到主进程的 turn-context，所以主进程
+ * 在每轮对话开始时把「谁 / 在哪个群 / 什么时候」写进 private/state/active-chat.json，
+ * 这里再读。**不能**把群号交给模型自己填 —— 模型会被提示注入诱导填别的群号，
+ * 那样这条限制就形同虚设。
+ */
+/** 是否持有 tools.group_history（admin 的 info 组里有）—— 有就能查任意群 */
+function privilegedGroupHistory() {
+  return permsOf(uid || "0").has("tools.group_history");
+}
+
+async function resolveGroupHistoryTarget() {
+  const want = String(rest[0] ?? "").trim();
+  if (privilegedGroupHistory()) {
+    if (!want) { console.log("请给出群号：group_history <gid> [count]"); process.exit(1); }
+    return want;
+  }
+  let cur = null;
+  try {
+    // 动态导入：本文件是启动即执行的脚本，顶层已 await 过若干 import，这里保持一致写法
+    const { currentChatOf } = await import(path.join(ROOT, "lib", "active-chat.mjs"));
+    cur = currentChatOf(uid || "0");
+  } catch { cur = null; }
+  if (!cur || cur.chatType !== "group") {
+    console.log(
+      "只能查「当前所在的群」的聊天记录。没记录到你最近在哪个群说过话 " +
+        "（或已经超过 30 分钟），先在那个群里 @ 我一句，再来查。",
+    );
+    process.exit(1);
+  }
+  if (want && want !== cur.targetId) {
+    console.log(`只能查当前群（${cur.targetId}）的记录；要查别的群请先在那个群里说话。`);
+    process.exit(1);
+  }
+  return cur.targetId;
 }
 
 // ── 权限等级：统一由 lib/op-policy.mjs 提供（与 /op 内置命令共用同一份实现） ──
@@ -136,7 +181,8 @@ async function main() {
     console.log("用法: node scripts/qq-cli.mjs --as <uid> <group_history|msg_detail|friend_list|group_list|ocr|group_file_url|download|delete_msg|napcat|op|deop> ...");
     process.exit(0);
   }
-  requirePerm(PERM[action] ?? `tools.${action}`);
+  // group_history 对所有人开放，权限判定在下面按「是否脱离当前群」单独做（见 resolveGroupHistoryTarget）
+  if (action !== "group_history") requirePerm(PERM[action] ?? `tools.${action}`);
 
   const nb = config.napcat.onebot;
   const bridge = new QQBridge({ host: nb.wsHost, port: nb.wsPort, token: nb.token });
@@ -145,7 +191,12 @@ async function main() {
     let out;
     switch (action) {
       case "group_history": {
-        out = await bridge.getGroupMsgHistory(Number(rest[0]), Math.min(Number(rest[1] ?? 20), 50));
+        const gid = await resolveGroupHistoryTarget();
+        // 条数参数：特权用户是 group_history <gid> <count>；非特权用户的群号已被换成当前群，
+        // 所以 rest[0] 就变成条数了。两种写法都认，省得模型记两套。
+        const countArg = privilegedGroupHistory() ? rest[1] : rest[0];
+        const count = Math.min(Math.max(Number(countArg ?? 20) || 20, 1), 50);
+        out = await bridge.getGroupMsgHistory(Number(gid), count);
         break;
       }
       case "msg_detail": {

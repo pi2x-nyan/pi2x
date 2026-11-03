@@ -20,6 +20,7 @@
     "@huggingface/transformers": "^4.2.0",
     "puppeteer-core": "^25.10.0",
     "typebox": "^1.3.25",
+    "undici": "^8.11.2",
     "ws": "^8.21.3"
   }
 }

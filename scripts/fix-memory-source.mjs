@@ -26,6 +26,7 @@
  *        # 归群；时间关联判不准的**一并删除**（默认是跳过、不动它们）
  */
 import fs from "node:fs";
+import { CONFIG_PATH, WHITELIST_PATH } from "../lib/config.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
@@ -50,7 +51,7 @@ const db = new DatabaseSync(DB);
 
 /** 找出「群来源但群号疑似写成了用户号」的条目 —— 特征：group:<某个已知用户QQ> */
 function findSuspects() {
-  const wlFile = path.join(ROOT, "whitelist.json");
+  const wlFile = WHITELIST_PATH;
   let userIds = [];
   try {
     userIds = Object.keys(JSON.parse(fs.readFileSync(wlFile, "utf8")).users ?? {});

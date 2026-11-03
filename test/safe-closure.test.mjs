@@ -25,6 +25,9 @@ const ALLOWED = new Set([
   "lib/mode.mjs",
   "lib/model-config.mjs",
   "lib/qqbridge.mjs",
+  // reply-guard.mjs：60 行纯函数，零依赖（控制词判定 + 句号整形），
+  // 安全模式发消息时也走同一套出口整形，值得放进来。
+  "lib/reply-guard.mjs",
   "lib/safe/sentry.mjs",
   "lib/safe/giveup.mjs",
   // whitelist.mjs：106 行、零依赖、纯 JSON 解析，属于「极小且稳定」。
@@ -138,8 +141,10 @@ test("安全模式确实需要 pi SDK（否则没有 agent 能力）", () => {
 });
 
 test("依赖闭包规模受控（防止不知不觉膨胀）", () => {
+  // 10 → 12：加了 lib/reply-guard.mjs（60 行纯函数、零依赖，管出口整形）。
+  // 上限只是刹车，不是目标；每加一个都要能说出「为什么非它不可」。
   assert.ok(
-    CLOSURE.files.length <= 10,
+    CLOSURE.files.length <= 12,
     `安全模式闭包已达 ${CLOSURE.files.length} 个文件：\n  ${CLOSURE.files.join("\n  ")}\n` +
       `请慎重 —— 每多一个依赖，就多一个「一起坏」的入口。`
   );

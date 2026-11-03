@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { WHITELIST_PATH, CONFIG_PATH } from "../lib/config.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -103,7 +104,7 @@ test("截图默认落点会尊重沙盒目录（否则沙盒内写不进去）",
 
 test("不得存在 allowOpEscalation 这类「跳过安全检查」的开关", () => {
   const files = [
-    path.join(ROOT, "config.json"),
+    CONFIG_PATH,
     path.join(ROOT, "lib", "config.mjs"),
     path.join(ROOT, "scripts", "qq-cli.mjs"),
     path.join(ROOT, "lib", "piagent.mjs"),
@@ -133,7 +134,7 @@ test("/op 与 qq-cli 的权限校验必须共用同一实现（防两侧漂移�
 });
 
 test("提权后门回归：qq-cli 在 operator 身份下无法自我提权（子进程实测）", () => {
-  const wlFile = path.join(ROOT, "whitelist.json");
+  const wlFile = WHITELIST_PATH;
   const backup = fs.readFileSync(wlFile, "utf8");
   try {
     // 找一个 operator 用户（用临时白名单更稳妥，但这里只读不改文件更安全）：
@@ -153,7 +154,9 @@ test("提权后门回归：qq-cli 在 operator 身份下无法自我提权（子
     } catch (e) {
       out = `${e?.stdout ?? ""}${e?.stderr ?? ""}`;
     }
-    assert.match(out, /拒绝|不能/, `operator 自我提权必须被拒，实际输出：${out.slice(-200)}`);
+    // 被拒的措辞随权限层实现而变（qq-cli 侧说「拒绝/不能」，工具门禁侧说「权限不足/没有该权限」），
+    // 断言只看「没提成」这个安全属性，不锁死具体文案。
+    assert.match(out, /拒绝|不能|权限不足|没有该权限/, `operator 自我提权必须被拒，实际输出：${out.slice(-200)}`);
     assert.equal(fs.readFileSync(wlFile, "utf8"), backup, "被拒后白名单不得有任何改动");
   } finally {
     fs.writeFileSync(wlFile, backup, "utf8");

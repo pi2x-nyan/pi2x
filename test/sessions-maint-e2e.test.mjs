@@ -10,6 +10,7 @@
  * 若会话目录里没有足够大的文件（例如全新部署），测试自动跳过。
  */
 import test from "node:test";
+import { SESSIONS_DIR } from "../lib/config.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -17,25 +18,40 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { slimFile, survey } from "../lib/sessions-maint.mjs";
+import { slimFile, survey, planSlim } from "../lib/sessions-maint.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const SESSIONS = path.join(ROOT, "sessions");
+const SESSIONS = SESSIONS_DIR;
 const MIN_SIZE = 200 * 1024; // 小于 200KB 的文件没有压缩历史，验证没意义
 
-function biggestSession() {
+/**
+ * 挑一个「真的能瘦」的真实文件。
+ *
+ * 【为什么不再只取最大的那个】2026-10-25 修完 planSlim 之后，最大的会话一个都瘦不动了 ——
+ * 它的压缩条目全挂在已断开的父链上，瘦身会丢历史，于是 planSlim 直接拒绝。
+ * 若还只试最大的那个，这个 e2e 就会**永远 skip**，等于悄悄失去真实文件的覆盖。
+ * 现在按体积从大到小扫，取第一个 planSlim 认为可瘦的；一个都没有才 skip。
+ */
+function slimmableSession() {
   try {
     const s = survey(SESSIONS);
-    return s.files.find((f) => f.bytes >= MIN_SIZE && !f.stale) ?? null;
+    const cands = s.files.filter((f) => f.bytes >= MIN_SIZE && !f.stale);
+    for (const f of cands) {
+      try {
+        const text = fs.readFileSync(f.path, "utf8");
+        if (planSlim(text).savedEntries > 0) return f;
+      } catch { /* 读不了就试下一个 */ }
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
 test("真实会话瘦身后，模型可见上下文逐项一致（id 序列完全相同）", (t) => {
-  const target = biggestSession();
+  const target = slimmableSession();
   if (!target) {
-    t.skip("会话目录里没有 >=200KB 的会话文件，跳过");
+    t.skip("会话目录里没有 >=200KB 且可安全瘦身的会话文件，跳过");
     return;
   }
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "slim-e2e-"));
@@ -75,9 +91,9 @@ test("真实会话瘦身后，模型可见上下文逐项一致（id 序列完�
 });
 
 test("真实会话瘦身后仍可被 pi 正常打开（leafId 可解析）", (t) => {
-  const target = biggestSession();
+  const target = slimmableSession();
   if (!target) {
-    t.skip("会话目录里没有 >=200KB 的会话文件，跳过");
+    t.skip("会话目录里没有 >=200KB 且可安全瘦身的会话文件，跳过");
     return;
   }
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "slim-e2e2-"));

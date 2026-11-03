@@ -19,9 +19,52 @@ import fs from "node:fs";
 import dns from "node:dns";
 import { URL } from "node:url";
 
-// 本机 IPv6 路由不可用（api.commandcode.ai 仅解析出 Cloudflare AAAA 且 connect 黑洞）→ 强制优先 IPv4。
-// 否则 Node 偶发先试 IPv6 → 黑洞式 ETIMEDOUT（表现为三个账号全部超时）。
-dns.setDefaultResultOrder("ipv4first");
+/**
+ * DNS 解析顺序（可用 env 覆盖）—— 这一行曾把服务搞挂，务必读完再改。
+ *
+ * 历史两个阶段，方向完全相反：
+ *   · 阶段一（旧网络）：本机 IPv6 到 Cloudflare 是黑洞 → 必须在进程里
+ *     写死 setDefaultResultOrder("ipv4first")，否则每个请求都先试 IPv6 挂在
+ *     那里，表现为「三/四个账号全部 ETIMEDOUT」。
+ *   · 阶段二（2026-09-24 网络变更后）：反过来 —— **IPv4 到 Cloudflare 不通，
+ *     IPv6 通**。而写死的 ipv4first 让 Node 优先走 IPv4，于是大请求全部
+ *     0.7s 级 ETIMEDOUT（实测对照：同一 5.68MB 请求 default 顺序 15.9s 成功，
+ *     ipv4first 0.7s 失败）；小请求偶尔靠 Happy Eyeballs 回退到 IPv6 才能过，
+ *     所以症状看起来时好时坏、且“只有大请求失败”。
+ *   · 结论：**两个方向都不能写死** —— 网络会变，写死哪一边早晚会翻车。
+ *     默认不动 Node 的选择（它默认 autoSelectFamily：IPv6/IPv4 并发尝试，
+ *     哪个先通先用）；确需强制时用 COMMANDCODE_DNS_ORDER 显式指定。
+ *
+ * 取值：default（默认，不干预）| ipv4first | ipv6first | verbatim
+ */
+const DNS_ORDER = (process.env.COMMANDCODE_DNS_ORDER ?? "default").toLowerCase();
+if (["ipv4first", "ipv6first", "verbatim"].includes(DNS_ORDER)) {
+  dns.setDefaultResultOrder(DNS_ORDER);
+}
+
+/**
+ * 长连接保活（对付手机链路到 Cloudflare 的**新建连接**周期性快速失败）。
+ *
+ * 【实测依据 2026-09-24/25】同一时刻对照：
+ *   直连上游（新建连接）0/3 失败（ETIMEDOUT 0.7~2.6s）
+ *   经本代理（复用已有连接）3/3 成功
+ * 也就是说“能不能连上”取决于连接是不是已建立的。而 Node fetch 默认空闲 4 秒就关，
+ * 每轮对话都得重新握手 → 必然踩上抖动窗口 → 12 次尝试全灭 → bot 只能回兜底文案。
+ * 把连接池的空闲保活拉长，让一条已验证可用的连接持续复用即可绕过大部分抖动；
+ * 代价为零（不发心跳请求、不消耗额度）。
+ */
+try {
+  const { Agent, setGlobalDispatcher } = await import("undici");
+  setGlobalDispatcher(new Agent({
+    keepAliveTimeout: Number(process.env.COMMANDCODE_KEEPALIVE_MS ?? 300000),
+    keepAliveMaxTimeout: Number(process.env.COMMANDCODE_KEEPALIVE_MAX_MS ?? 900000),
+    connections: Number(process.env.COMMANDCODE_POOL_CONNS ?? 8),
+    connect: { timeout: Number(process.env.COMMANDCODE_CONNECT_TIMEOUT_MS ?? 20000) },
+  }));
+  console.log("[cc-go] 连接池：keep-alive 5 分钟 · 最多 8 连接 · 连接超时 20s");
+} catch (e) {
+  console.log("[cc-go] undici 不可用，沿用默认连接池:", String(e?.message ?? e).slice(0, 80));
+}
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,23 +72,69 @@ import { fileURLToPath } from "node:url";
 /** 项目根：由本文件位置推导，避免写死部署路径 */
 const ROOT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
+/**
+ * 号池文件路径：private/.cc-pool.json 优先，其次旧位置 <root>/.cc-pool.json。
+ *
+ * 【为什么不能写死 ROOT_DIR/.cc-pool.json】
+ * 隐私数据迁进 private/ 后，写死旧路径会读不到池子。
+ * 注意本脚本是长期常驻进程（screen 托管）：**迁移前启动的进程会一直
+ * 拿着旧的解析结果**，必须重启才会生效。
+ */
+function resolvePoolFile() {
+  const inPrivate = path.join(ROOT_DIR, "private", ".cc-pool.json");
+  try {
+    if (fs.statSync(inPrivate).isFile()) return inPrivate;
+  } catch {
+    /* private/ 未启用或未搬完 */
+  }
+  return path.join(ROOT_DIR, ".cc-pool.json");
+}
+
 const BASE = "https://api.commandcode.ai";
 const CC_VERSION = "0.26.20";
 const PORT = Number(process.env.COMMANDCODE_PROXY_PORT ?? 20228);
 const MODELS_URL = `${BASE}/provider/v1/models`;
 const CATALOG_URL = "https://cdn.jsdelivr.net/npm/command-code@latest/dist/bundled/command-code-knowledge/reference/models.md";
-const POOL_FILE = process.env.COMMANDCODE_POOL_FILE ?? path.join(ROOT_DIR, ".cc-pool.json");
+const POOL_FILE = process.env.COMMANDCODE_POOL_FILE ?? resolvePoolFile();
 const HEARTBEAT_MS = Number(process.env.COMMANDCODE_HEARTBEAT_MS ?? 5000);
 /** 单次尝试的「等响应头」超时：连接/排队问题快速暴露，而不是挂到客户端超时 */
 const HEADER_TIMEOUT_MS = Number(process.env.COMMANDCODE_HEADER_TIMEOUT_MS ?? 60000);
 /** 流式传输中「无数据」空闲超时（正常流有事件/心跳，长时间静默视为卡死） */
 const IDLE_TIMEOUT_MS = Number(process.env.COMMANDCODE_IDLE_TIMEOUT_MS ?? 300000);
 /** 账号池轮询轮数（网络抖动时多试一轮） */
-const ATTEMPT_ROUNDS = Number(process.env.COMMANDCODE_ATTEMPT_ROUNDS ?? 2);
+const ATTEMPT_ROUNDS = Number(process.env.COMMANDCODE_ATTEMPT_ROUNDS ?? 4);
+/**
+ * 轮次之间的退避（毫秒，逐轮递增）。
+ * 【为什么需要】上游到 Cloudflare 的连接会**瞬时抖动**：失败很快（ETIMEDOUT 常在 0.5~2.7s 返回），
+ * 但下一次可能就正常。原先只等 1.2s、仅 2 轮 —— 抖动窗口内 8 次尝试会在 2 秒内全部烧完，
+ * 整轮就变成空回复。改成递增退避 + 3 轮，把这类瞬时抖动“熬过去”。
+ */
+const ROUND_BACKOFF_MS = String(process.env.COMMANDCODE_ROUND_BACKOFF_MS ?? "1000,4000,10000,20000")
+  .split(",")
+  .map((x) => Number(x))
+  .filter((x) => Number.isFinite(x) && x >= 0);
 /** 账号 429/额度超限后的冷却时长（默认 10 分钟；命中 Retry-After 时以它为准，上限 1 小时）。
  *  作用：把「已超额」的账号暂时踢出轮询，避免每次都白跑一次再切（省 ~2s/请求 的额外延迟）。 */
 const COOLDOWN_MS = Number(process.env.COMMANDCODE_429_COOLDOWN_MS ?? 600000);
 const COOLDOWN_MAX_MS = Number(process.env.COMMANDCODE_429_COOLDOWN_MAX_MS ?? 3600000);
+/**
+ * 账号「余额不足以覆盖本次请求」（上游 400 insufficient credits）的冷却时长：默认 1 小时。
+ * 这类失败不会自己好（要充值或等月度重置），所以比限流冷却得更久，
+ * 否则每个请求都会把已经没有额度的账号白试一遍（实测白试了 40 次）。
+ */
+const CREDITS_COOLDOWN_MS = Number(process.env.COMMANDCODE_CREDITS_COOLDOWN_MS ?? 3600000);
+/** 全池状态文件：供 scripts/cc-pool-alert.sh 判断「是不是所有账号都不可用了」并发告警 */
+const POOL_STATE_FILE = path.join(ROOT_DIR, "private", "state", "cc-pool-state.json");
+
+/** 写全池状态（成功/失败都写；带时间戳，告警脚本据此判断新鲜度） */
+function writePoolState(ok, reason = "") {
+  try {
+    fs.mkdirSync(path.dirname(POOL_STATE_FILE), { recursive: true });
+    fs.writeFileSync(POOL_STATE_FILE, JSON.stringify({ ok, reason, at: new Date().toISOString() }));
+  } catch {
+    /* 写不了就算了，不影响主流程 */
+  }
+}
 /** 账号名 -> 冷却到期时间戳 */
 const coolingUntil = new Map();
 const RETRY_STATUS = new Set([401, 402, 403, 408, 429, 500, 502, 503, 504]);
@@ -248,6 +337,18 @@ const server = http.createServer(async (req, res) => {
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
         const body = JSON.parse(bodyRaw || "{}");
         const wantStream = body.stream !== false;
+        // 只服务本代理声明的模型。收到别的模型名（例如 OmniRoute 把 anthropic:glm-4.6 之类
+        // 误路由到这里）直接拒绝 —— 否则会原样转发上游，4 账号 × 2 轮全被 403 拒掉，纯浪费。
+        const reqModel = String(body.model ?? "");
+        if (!Object.prototype.hasOwnProperty.call(MODEL_ALIASES, reqModel)) {
+          const msg = "unsupported model: " + reqModel + "（本代理仅提供 deepseek-flash）";
+          console.log("[cc-go] " + msg);
+          // 注意：此处 endRes/心跳尚未初始化（在下面才定义），所以**不能**用 endRes，
+          // 直接回 400 即可（此刻还没发响应头）。—— 之前用 endRes() 触发过 TDZ 异常。
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: msg } }));
+          return;
+        }
         const upstreamModel = resolveUpstream(body.model);
         const envelope = buildEnvelope(body, upstreamModel);
         const cmplId = "chatcmpl-" + Math.random().toString(36).slice(2, 14);
@@ -266,6 +367,11 @@ const server = http.createServer(async (req, res) => {
 
         let roleSent = false, usage = null, finishReason = "stop";
         let content = "", reasoning = "";
+        // 上游把「请求被拒」之类的错误藏在 HTTP 200 的流里（实测超限时回
+        // {"type":"error","error":{"message":"Bad Request","statusCode":400}}）。
+        // 不识别的话客户端只会看到一个“一个 delta 都没有的空流”，bot 报「模型返回了空内容」，
+        // 完全看不出真因；而且这个失败是**请求级**的（换账号也没用），应立即失败、不再白传 12 次。
+        let upstreamErr = null;
         const toolByKey = new Map();          // toolCallId -> { index, id, name, args }
         let toolIndex = 0;
         const writeChunk = (delta, extra = {}) => {
@@ -316,14 +422,37 @@ const server = http.createServer(async (req, res) => {
                 signal: ac2.signal,
               });
               clearTimeout(headerTimer);
-              if (r.ok) { up = r; acct = cand; coolingUntil.delete(cand.name); break outer; }
+              if (r.ok) { up = r; acct = cand; coolingUntil.delete(cand.name); writePoolState(true, ""); break outer; }
               const t = await r.text().catch(() => "");
               lastErr = `upstream ${r.status}: ${t.slice(0, 200)}`;
-              if (r.status === 429 || r.status === 402) {
+              // 额度类失败：429/402，以及 400 的「insufficient credits」（余额不够覆盖本次请求）
+              const isCredits = r.status === 400 && /insufficient credits|insufficient_credits/i.test(t);
+              if (r.status === 429 || r.status === 402 || isCredits) {
                 const ra = Number(r.headers.get("retry-after"));
-                const cd = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, COOLDOWN_MAX_MS) : COOLDOWN_MS;
+                const base = isCredits ? CREDITS_COOLDOWN_MS : COOLDOWN_MS;
+                const cd = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, Math.max(base, COOLDOWN_MAX_MS)) : base;
                 coolingUntil.set(cand.name, Date.now() + cd);
-                console.log(`[cc-go] 账号 ${cand.name} 额度/限流(${r.status})，冷却 ${(cd / 60000).toFixed(1)} 分钟后重试`);
+                console.log(`[cc-go] 账号 ${cand.name} ${isCredits ? "余额不足" : "额度/限流"}(${r.status})，冷却 ${(cd / 60000).toFixed(1)} 分钟后重试`);
+                // 注意：**不要**在这里写 writePoolState(false) —— 这只是「单个账号」没钱，
+                // 其他账号还能用；全池状态只能在整个轮询彻底失败时（下面的 !up 分支）才置为不可用。
+                // 否则单号欠费就会误报「号池不可用」告警。
+              }
+              // 模型不被上游识别：是请求本身的问题，换账号也没用 → 立即停止轮询，别再白试
+              if (r.status === 403 && /Model\/provider not recognized/i.test(t)) {
+                console.log(`[cc-go] 上游不认这个模型，停止轮询：${t.slice(0, 120)}`);
+                lastErr = `model not recognized: ${t.slice(0, 160)}`;
+                clearTimeout(headerTimer);
+                break outer;
+              }
+              // 【账号级失败必须换号重试】余额不足/额度类失败是**单个账号**的问题，
+              // 其他账号仍可能可用，因此必须继续下个候选，不能 break outer 直接放弃。
+              // （400 不在 RETRY_STATUS 里 —— 早期写法会让「余额不足」走到下面
+              //   那个 break outer，表现为「一个号没钱 → 整池放弃」，实测踩过。）
+              if (isCredits) {
+                console.log(`[cc-go] 账号 ${cand.name} 余额不足，切换下一个账号`);
+                // 用 continue（内层）而非 continue outer：后者会跳到下一轮，
+                // 把本轮剩下未试的账号全部略过；ATTEMPT_ROUNDS=1 时甚至一个都不试。
+                continue;
               }
               console.log(`[cc-go] 账号 ${cand.name} 失败(${r.status}) ${((Date.now()-tAttempt)/1000).toFixed(1)}s，切换下一个`);
               if (!RETRY_STATUS.has(r.status)) { clearTimeout(headerTimer); break outer; }
@@ -337,11 +466,16 @@ const server = http.createServer(async (req, res) => {
               ac.signal.removeEventListener("abort", onClientAbort);
             }
           }
-          if (round < ATTEMPT_ROUNDS - 1) await new Promise((r) => setTimeout(r, 1200));
+          if (round < ATTEMPT_ROUNDS - 1) {
+            const wait = ROUND_BACKOFF_MS[Math.min(round, ROUND_BACKOFF_MS.length - 1)] || 1000;
+            console.log(`[cc-go] 第 ${round + 1} 轮全失败，${(wait / 1000).toFixed(1)}s 后重试（共 ${ATTEMPT_ROUNDS} 轮）`);
+            await new Promise((r) => setTimeout(r, wait));
+          }
         }
         if (ac.signal.aborted) return endRes();
         if (!up) {
           console.log(`[cc-go] 全部账号失败(${pool.length}个×${ATTEMPT_ROUNDS}轮): ${lastErr}`);
+          writePoolState(false, lastErr);
           if (wantStream) { res.write(`data: ${JSON.stringify({ error: { message: `all accounts failed: ${lastErr}` } })}\n\n`); res.write("data: [DONE]\n\n"); } else res.write(JSON.stringify({ error: { message: `all accounts failed: ${lastErr}` } }));
           return endRes();
         }
@@ -351,6 +485,13 @@ const server = http.createServer(async (req, res) => {
         // ③ 事件处理
         const handleEvent = (ev) => {
           const t = ev.type ?? "";
+          // ① 流内错误帧：捕获并停止转发 → 外层当作本次尝试失败（换号/报错），避免静默转成空流
+          if (t === "error" || ev.error) {
+            const em = ev.error?.message ?? ev.message ?? JSON.stringify(ev.error ?? ev).slice(0, 200);
+            upstreamErr = `upstream stream error: ${em}`;
+            console.log(`[cc-go] 上游流内错误: ${String(em).slice(0, 200)}`);
+            return false;
+          }
           if (t.includes("reasoning") || t.includes("thinking")) {
             if (t.endsWith("-start") || t.endsWith("-end") || t.endsWith("start") || t.endsWith("end")) return true;
             const txt = String(ev.text ?? ev.delta ?? ev.content ?? "");
@@ -451,6 +592,9 @@ const server = http.createServer(async (req, res) => {
           }
         }
         if (ended) return endRes();
+        // 上游在流里报了错（已停止转发）：把它当本次尝试失败抛出，由外层换账号/汇总报错。
+        // 这样“空回复”不再是黑盒子 —— 日志里会直接写上游的原话。
+        if (upstreamErr) throw new Error(upstreamErr);
 
         // ④ 收尾
         const toolList = [...toolByKey.values()].sort((a, b) => a.index - b.index);

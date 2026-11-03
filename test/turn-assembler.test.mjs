@@ -137,7 +137,8 @@ test("submit：工具已发但最终文本不同 → 照常返回（不能误吞
   s.stream("这是完全不同的补充说明，必须发给用户。");
   s.finish();
   const out = await p;
-  assert.equal(out, "这是完全不同的补充说明，必须发给用户。");
+  // 出口整形会把全角句号换成换行（说话方式规则：不打句号），内容必须一字不少
+  assert.equal(out.replace(/\n/g, ""), "这是完全不同的补充说明，必须发给用户");
 });
 
 test("_sentByQqToolThisTurn：工具失败（isError）不算已发送", () => {

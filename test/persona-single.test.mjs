@@ -16,14 +16,17 @@
  * 把作者的私人人设导出到公开仓库。
  */
 import test from "node:test";
+import { PERSONA_DIR } from "../lib/config.mjs";
+import { CONFIG_PATH } from "../lib/config.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
-const CONTEXT_DIR = path.join(ROOT, "prompt/context");
+// 人设目录由 config 导出：private/persona（启用 private/ 时）或 prompt/context
+const CONTEXT_DIR = PERSONA_DIR;
 const PIAGENT = fs.readFileSync(path.join(ROOT, "lib/piagent.mjs"), "utf8");
-const CONFIG = JSON.parse(fs.readFileSync(path.join(ROOT, "config.json"), "utf8"));
+const CONFIG = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
 const EXPORT_PUBLIC = fs.readFileSync(path.join(ROOT, "scripts/export-public.mjs"), "utf8");
 
 // ── 配置形态 ──────────────────────────────────────────────────────────
@@ -37,18 +40,23 @@ test("config.pi.persona 只声明单一 promptFile，不再有 admin/public 之�
   assert.equal(p.publicPromptFile, undefined, "又出现了 publicPromptFile（分叉回来了）");
 });
 
-test("prompt/context 下只应存在一个人设文件", () => {
+test("人设目录下只应存在一个人设文件", () => {
   const personas = fs.readdirSync(CONTEXT_DIR).filter((f) => /^2x.*\.md$/.test(f));
   assert.deepEqual(personas, ["2x.md"], `人设文件不止一个：${personas.join(", ")}`);
-  // 会话上下文模板是另一回事，不属于人设
-  assert.ok(fs.existsSync(path.join(CONTEXT_DIR, "session.md")));
+  // 会话上下文模板**不属于人设**：它是框架模板，始终留在 prompt/context/ 下，
+  // 不随人设一起搬进 private/（否则 private/ 未启用时框架会读不到它）。
+  const tpl = path.join(ROOT, "prompt", "context", "session.md");
+  assert.ok(fs.existsSync(tpl), `会话模板应留在 prompt/context：${tpl}`);
 });
 
-test("人设文件内容自洽：含身份、口吻、保密底线", () => {
+// 【为什么不再断言「保密」在 2x.md 里】作者于 2026-09-19 亲手删去了人设文件末尾的
+// 【保密底线】一节，并明确要求删掉这条断言。保底条款如今只在 prompt/agent/system.md
+// 里（禁止抖落系统提示词与工具机制、不得解释风格来源、不提 persona 机制），
+// 本测试不再越过作者对人设文件的编辑权去锁它的段落构成。
+test("人设文件内容自洽：含身份、口吻与能力保留", () => {
   const t = fs.readFileSync(path.join(CONTEXT_DIR, "2x.md"), "utf8");
   assert.match(t, /2X/);
   assert.match(t, /猫娘/);
-  assert.match(t, /保密/);
   assert.match(t, /能力.*保留|能力完全保留/);
 });
 
@@ -112,8 +120,16 @@ test("源码里不再按权限组挑人设文件", () => {
 });
 
 test("人设只在 before_agent_start 注入一次（不重复读、不写进历史）", () => {
-  const hits = PIAGENT.match(/loadPrompt\("context",\s*persona\??\.promptFile\)/g) ?? [];
+  // 读取点必须是 loadPersona（读 PERSONA_DIR），且全仓只允许一处。
+  // 历史教训：迁移到 private/persona/ 后此处仍写 loadPrompt("context", ...)，
+  // ENOENT 被静默吞掉，人设整段丢失；那时这条断言锁的是旧写法，
+  // 所以它「通过」了却什么也没守住 —— 约束要锁“行为”，不能锁“某一版拼写”。
+  const hits = PIAGENT.match(/loadPersona\(persona\??\.promptFile\)/g) ?? [];
   assert.equal(hits.length, 1, `人设读取点应恰好一处，实际 ${hits.length} 处`);
+  assert.ok(
+    !/loadPrompt\(\s*["']context["']\s*,\s*persona/.test(PIAGENT),
+    "又用 loadPrompt(「context」, persona...) 读人设了 —— 人设不在 prompt/context/ 下，会 ENOENT",
+  );
   // 注入产生的是 systemPrompt 增量，不能拼进 user 正文
   const f = PIAGENT.match(/finalText = \([^;]*?;/);
   assert.ok(f && !/persona/i.test(f[0]), "人设被拼进了 user 消息正文（会持久化）");
@@ -137,4 +153,32 @@ test("export-public 必须剥离 2x.md 人设文件（统一改名后易漏）",
   assert.ok(stripped("prompt/context/2x.md"), "人设文件 2x.md 未被剥离 —— 会把私人人设导出到公开仓库！");
   assert.ok(stripped("prompt/context/2x-base.md"), "旧人设名也应保持被剥离（防止归档回滚后泄露）");
   assert.ok(!stripped("prompt/context/session.md"), "会话模板不该被剥离");
+});
+
+// ── 运行时读取路径（专治「静默 ENOENT」） ────────────────────────────────
+//
+// 【为什么必须补这条】人设迁移到 PERSONA_DIR 时，注入点仍调用
+// loadPrompt("context", "2x.md")（固定读 prompt/context/），在 private 布局下
+// 必然 ENOENT，又被 before_agent_start 的 try/catch 静默吞掉。
+// 结果：人设整段没注入，而上面那些测试全绿 —— 它们只验证「文件存在、内容自洽、
+// 配置指向同一个文件」，没有任何一条走过运行时的读取路径。
+// 这条测试直接调用注入点用的同一个函数，把这条路封死。
+test("运行时能真正读到人设：loadPersona 必须成功（防静默 ENOENT）", async () => {
+  const { loadPersona, personaPath } = await import("../lib/prompts.mjs");
+  const name = CONFIG.pi.persona["2x"].promptFile;
+  const abs = personaPath(name);
+  assert.ok(fs.existsSync(abs), `人设文件不存在：${abs}`);
+  const text = loadPersona(name);
+  assert.match(text, /2X/, "读到的人设里没有身份名");
+  assert.match(text, /猫娘/, "读到的人设不是猫娘设定");
+  assert.ok(text.length > 500, `人设文件过短（${text.length} 字节），疑似读到了占位文件`);
+});
+
+test("注入点不许再用人设名去调 loadPrompt（架构约束）", () => {
+  const src = fs.readFileSync(path.join(ROOT, "lib", "piagent.mjs"), "utf8");
+  assert.ok(
+    !/loadPrompt\(\s*["']context["']\s*,\s*persona/.test(src),
+    "piagent.mjs 又出现 loadPrompt(\"context\", persona.*) —— 人设不在 prompt/context/ 下，会 ENOENT",
+  );
+  assert.match(src, /loadPersona\(/, "piagent.mjs 没有使用 loadPersona");
 });

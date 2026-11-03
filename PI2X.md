@@ -23,6 +23,7 @@ QQ 用户 ⇄ NapCat (OneBot11 WS) ⇄ PI2X Bridge ⇄ pi AgentSession
 ├── control.mjs
 ├── lib/
 │   ├── piagent.mjs           # Agent 管理（会话/TurnAssembler/工具/命令/风险门禁/凭据工具）
+│   ├── strix-session.mjs     # strix 框架会话管理（常驻 worker、按会话切换、孤儿清扫）
 │   ├── qqbridge.mjs          # OneBot11 WS 客户端（事件/API/重连）
 │   ├── napcat.mjs            # NapCat 生命周期 + OneBot 配置同步
 │   ├── napcat-api.mjs        # NapCat 接口风险分级表 + 审核
@@ -116,8 +117,77 @@ Windows 端 `win-agent`（`<PI2X_ROOT_WIN>\win-agent\service.mjs`，端口 8123�
 
 - `$` 执行 Linux bash（仅 admin，cwd=workspace）
 - `>` 执行 Windows cmd（仅 admin，经 win-agent）
-- `/` 内置命令（help/status/memory/perms/whoami/op/deop/stop/restart/cred 等）
+- `/` 内置命令（help/status/memory/perms/whoami/op/deop/stop/restart/cred/strix/pi2x 等）
 - 工具超时参数必须显式指定；无整体回复超时（/stop 或自然结束）
+
+## 框架切换（strix ⇄ pi2x）
+
+**仅 admin 私聊**可用（群聊硬拒绝，入口与路由两道判定）。切换是**按会话**的：
+只影响触发者自己，其他用户照旧走 PI2X 主 agent。
+
+| 命令 | 作用 |
+|---|---|
+| `/strix new <会话名> [目标...] [--mode quick\|standard\|deep] [--budget N] [--turns N] [--dir <目录>]` | 新建会话并接入（目标可省；预算/轮次默认不限） |
+| `/strix ls [n]` | 列出历史会话（含状态/模式/花费/目标） |
+| `/strix use <编号\|run名> [指令]` | 接回旧会话；给了指令就当新一轮注入 |
+| `/strix status` | 当前是否接入、agent 状态、轮次、花费、子代理数 |
+| `/strix report [run名]` / `findings` | 看报告 / 漏洞清单 |
+| `/strix off` 或 `/pi2x` | 退回 PI2X 主框架 |
+
+**第一个位置参数是「会话名」，不是扫描目标**。目标可以不给：`/strix new audit` 就是建一个
+叫 `audit` 的会话，接进来说要扫什么即可。目标也不限于 URL —— 仓库、本地目录/文件、
+OpenAPI/Swagger 规格、IP 都是合法目标（所以不做格式校验，交给 strix 自己判）。
+
+**预算与轮次默认不限** —— strix 原生默认就是 `--max-budget=None`、`--max-turns=500`，
+只有你显式给 `--budget/--turns` 才会传。别默认套限额：那是把一个自主会话变成
+「跑到一半被掐断」。
+
+**会话名随便起**（含中文）：strix 只吃 ASCII 且拿它当目录名，所以显示名与落盘名分离
+（`slugOf` 转换 + `<run>/.label` 记显示名；`ls`/`use` 都认你起的名字）。
+
+### 懒启动（重要）
+
+`/strix new` / `/strix use` **不立即拉起进程**，只登记；**你说的第一句话才真正启动**，
+那句话就是它的首轮任务指令。这不是取巧，是因为：
+
+1. 只给名字时拉起 strix，agent 拿到的是空任务，不知道该干什么；
+2. strix 自己会**拒绝恢复**「无目标、无指令」的会话（`run.json has no targets_info`）。
+
+拿第一句话当任务，两个问题一起解。后续轮次直接说话就行。
+
+### 实现要点
+
+- **常驻会话，不是一轮一进程**：`strix/scripts/pi2x_worker.py` 把 strix 以
+  `run_strix_scan(interactive=True)` 跑成长期进程，`coordinator.send()` 注入用户消息。
+  strix 在 agent 调 `respond_to_user` 时 park 成 waiting，正好等于「交付答复并让出控制权」，
+  所以多轮对话是它原生能力，不靠 `--resume` 重放历史。
+- **正式答复从 `respond_to_user` 的工具参数取**，不在正文流里（正文只是干活时的叙述）→
+  worker 分别标记 `kind=reply` / `kind=progress`。
+- **worker 主动推 stdout**（`stdout_loop`），不是等 Node 侧 poll；
+  且 Node 侧必须「看到过 running」才把 waiting 当本轮结束（否则首轮空手返回）。
+- **不传 `-n`**：strix 的 `-n` 会强制要求 `-t`，而我们的 worker 是自己调
+  `run_strix_scan()` 的，不需要它；不传才能走无目标会话。
+- **会话名**：strix 没有 `--run-name` 参数，名字由 `prepare_run` 内部调
+  `generate_run_name()` 生成。worker 通过替换该模块函数来接管命名（不能改 args 属性，
+  因为那里不是从 args 读的）。重名会在命令层拦下 —— strix 的 run 目录就是会话名，
+  重名会让「新建」变成「悄悄接续旧的」。
+- **argv 分两段**：`[--name X] [--workspace Y] -- <strix 原生参数>`。
+  早先多写了一个开头的 `--`，worker 把第一个 `--` 当成前置段结束符，
+  `--name` 就被原样丢给 strix 的 argparse（报「参数不合法」）。
+- **会话落盘**：`strix/runs/strix_runs/<run_name>/`。worker 的 cwd 与 spawn 的 cwd
+  都必须是 `strix/runs`（strix 用 `cwd/strix_runs/<name>` 算目录）——
+  cwd 不一致时 run 会落到两个不同目录，`/strix ls` 就看不到刚建的会话。
+- **挂目录的限制**：strix 的沙箱只允许挂「它自己 cwd 之内」的路径
+  （`base_dir = Path.cwd()`），挂外面的目录会在沙箱启动时报
+  `failed to read local dir artifact`。所以无目标时默认**什么都不挂**；
+  确实要挂目录就用 `--dir`，且路径需在 `strix/runs` 之内。
+- **孤儿防护**：worker 收 SIGTERM/SIGHUP 即退；bridge 启动时 `sweepStrixOrphans()`
+  清理 ppid=1 的残留 worker（kill -9/OOM 后不留白跑的 agent 与浏览器）。
+- **启动失败要立即报**：worker 的 stderr 会被攒下并提纯（`extractStrixError`），
+  进程早退即刻失败 —— 早先只会等满 120s 吐一句「启动超时」，
+  真正的原因就静默躺在 stderr 里。
+- **状态提示**：`private/state/strix-sessions.json` 记「某人上次用哪个会话」，
+  仅用于重启后提示，**不自动接管**（防重启后自己接着扫生产环境）。
 
 ## 重启
 

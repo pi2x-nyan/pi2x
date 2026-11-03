@@ -25,6 +25,7 @@
  *   node scripts/rollback.mjs [--reason "为什么回退"] [--dry-run] [--sha <commit>]
  */
 import fs from "node:fs";
+import { CONFIG_PATH, WHITELIST_PATH } from "../lib/config.mjs";
 import path from "node:path";
 import { spawnSync, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -197,7 +198,7 @@ function main() {
 function notify(text) {
   try {
     // 同步读 whitelist.json 取管理员，避免引入异步链
-    const wl = JSON.parse(fs.readFileSync(path.join(ROOT, "whitelist.json"), "utf8"));
+    const wl = JSON.parse(fs.readFileSync(WHITELIST_PATH, "utf8"));
     for (const [uid, preset] of Object.entries(wl.users ?? {})) {
       if (preset !== "admin") continue;
       spawnSync(process.execPath, [path.join(ROOT, "scripts", "send-notify.mjs"), uid, text], { cwd: ROOT, timeout: 15000, stdio: "ignore" });

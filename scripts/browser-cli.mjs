@@ -23,6 +23,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CdpBrowser, getBrowser } from "./browser-lib.mjs";
+import { BROWSER_PROFILE_DIR, BROWSER_PROFILE_OP_DIR } from "../lib/config.mjs";
 
 /** 项目根：由本文件位置推导，避免写死部署路径 */
 const ROOT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -73,7 +74,8 @@ async function ensureChrome(port) {
     );
     return false;
   }
-  const profile = port === 9222 ? path.join(ROOT_DIR, "browser-profile") : path.join(ROOT_DIR, "browser-profile-op");
+  // profile 目录经 config 统一派生（private/browser-profile* 优先）
+  const profile = port === 9222 ? BROWSER_PROFILE_DIR : BROWSER_PROFILE_OP_DIR;
   try { fs.mkdirSync(profile, { recursive: true }); } catch {}
   try {
     spawn(bin, [

@@ -38,9 +38,9 @@ function fakeMe() {
 
 const build = (perms) => buildTools({ me: fakeMe(), perms, userId: "1000000001" });
 
-test("admin 拿到全部 17 个工具，且顺序与重构前一致", () => {
+test("admin 拿到全部 18 个工具，且顺序与重构前一致", () => {
   const names = build(ADMIN_PERMS).map((t) => t.name);
-  assert.equal(names.length, 17, `工具数应为 17，实测 ${names.length}`);
+  assert.equal(names.length, 18, `工具数应为 18，实测 ${names.length}`);
   assert.deepEqual(
     names,
     [
@@ -52,6 +52,7 @@ test("admin 拿到全部 17 个工具，且顺序与重构前一致", () => {
       "list_reminders",
       "clear_history",
       "run_task",
+      "ticket_list",
       "subagent_send",
       "subagent_result",
       "get_credential",

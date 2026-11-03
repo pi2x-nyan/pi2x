@@ -170,7 +170,7 @@ const RULES = [
  */
 function trackedFiles() {
   try {
-    const out = execFileSync("git", ["-C", ROOT, "ls-files"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+    const out = execFileSync("git", ["-C", ROOT, "ls-files"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 })
       .split("\n")
       .filter(Boolean);
     if (out.length) return out;
@@ -178,7 +178,7 @@ function trackedFiles() {
     /* 不是 git 仓库 → 走遍历 */
   }
   const acc = [];
-  const skip = new Set([".git", "node_modules", "tmp", "logs", "state", "sessions", "sandbox", "workspace", "agent-dir", "browser-profile", "browser-profile-op", "napcat", "win-agent"]);
+  const skip = new Set([".git", "node_modules", "tmp", "logs", "state", "sessions", "sandbox", "workspace", "agent-dir", "browser-profile", "browser-profile-op", "napcat", "win-agent", "private"]); // private/ 含密钥（.cc-pool.json 等），遍历回退路径也必须跳过
   const walk = (dir) => {
     let names;
     try {
@@ -203,11 +203,29 @@ function trackedFiles() {
   return acc;
 }
 
+/**
+ * 单文件扫描体积上限。
+ *
+ * 【为什么必须有】曾经只靠扩展名过滤，而 `strix/patches/strix-orig/bin/strix-tui`
+ * （**无扩展名的 8.4MB 二进制**）就这么通过了过滤，被当 UTF-8 文本读入并跑完
+ * 全部 30 条正则 → 子进程 2GB 堆直接爆（回归测试里的“当前仓库扫描结果为全零”
+ * 就因此 OOM）。体积上限与下面的二进制嗅探一起把这类文件彻底挡住。
+ */
+const MAX_SCAN_BYTES = 1024 * 1024;
+
 /** 跳过明显不该扫的二进制/体积大的文件 */
 function isScannable(rel) {
   if (rel === SELF) return false; // 规则文件里写着各种“像密钥的**模式**”，扫自己只会产生假阳性
-  if (/\.(png|jpg|jpeg|gif|webp|pdf|zip|gz|tar|woff2?|ttf|so|node|wasm|db|bundle)$/i.test(rel)) return false;
+  if (/\.(png|jpg|jpeg|gif|webp|pdf|zip|gz|tar|woff2?|ttf|so|node|wasm|db|bundle|pyc|pyo|whl|onnx|pack|idx|sqlite|sqlite3|exe|dll|bin|mp4|mp3|wav|7z|rar|xz|bz2)$/i.test(rel)) return false;
   if (rel.startsWith("package-lock.json")) return false; // 依赖清单，量大且非自研
+  // 第三方/生成目录：venv（本机 421MB）、__pycache__、node_modules 等
+  if (/(^|\/)(__pycache__|\.venv|venv|site-packages|node_modules|\.mypy_cache|\.pytest_cache|eggs|\.git)(\/|$)/.test(rel)) return false;
+  // 体积护栏：读成字符串再跑正则会放大数倍内存
+  try {
+    if (fs.statSync(path.join(ROOT, rel)).size > MAX_SCAN_BYTES) return false;
+  } catch {
+    return false;
+  }
   return true;
 }
 
@@ -216,6 +234,9 @@ const ALLOWLIST = [
   { id: "qq-number", file: /^test\//, note: "测试夹具里的假号码" },
   { id: "private-ip", file: /^test\/winhost\.test\.mjs$/, note: "winhost 测试用的地址样本" },
   { id: "qq-number", file: /^(lib|scripts|test)\//, note: "文档/注释里刻意使用的假号码" },
+  // vendored 的第三方 strix 文档里有示例 QQ 号（上游内容，非本机身份信息）。
+  // 不豁免的话每次扫描都报 7 处中危，把真问题淹没在噪音里。
+  { id: "qq-number", file: /^strix\/patches\//, note: "vendored 第三方文档里的示例号码" },
 ];
 
 /** 明显是伪造的测试号码（1 开头 10 位），命中则一律不算真实 QQ */
@@ -243,20 +264,32 @@ function allowed(hit, rel) {
  * 格式：.private-terms（每行一个词，文件被 .gitignore 忽略）
  */
 function loadPrivateTerms() {
-  try {
-    return fs
-      .readFileSync(path.join(ROOT, ".private-terms"), "utf8")
-      .split("\n")
-      .map((x) => x.trim())
-      .filter((x) => x && !x.startsWith("#"));
-  } catch {
-    return [];
+  // 【路径】词表随「私密数据收进 private/」搬到了 private/.private-terms，
+  // 而这里曾写死 ROOT/.private-terms → ENOENT → 静默回退成兜底正则。
+  // 两个位置都试，private/ 优先（与 lib/config.mjs 的 privPath 一致）。
+  for (const rel of ["private/.private-terms", ".private-terms"]) {
+    try {
+      return fs
+        .readFileSync(path.join(ROOT, rel), "utf8")
+        .split("\n")
+        .map((x) => x.trim())
+        .filter((x) => x && !x.startsWith("#"));
+    } catch {
+      /* 换下一个位置 */
+    }
   }
+  return [];
 }
 const PRIVATE_TERMS = loadPrivateTerms();
 for (const r of RULES) {
   if (r.private) {
-    r.re = PRIVATE_TERMS.length ? new RegExp(PRIVATE_TERMS.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g") : /$^/;
+    // 兜底用 /(?!)（永不匹配），**不能用 /$^/**：
+    // /$^/ 会匹配空字符串，而它没有 g 标志 → exec 永远返回同一个匹配、
+    // lastIndex++ 守卫对非全局正则无效 → 死循环把堆撑爆（实测：扫到 0 字节
+    // 文件时 OOM）。永不匹配的正则无论有无 g 都安全。
+    r.re = PRIVATE_TERMS.length
+      ? new RegExp(PRIVATE_TERMS.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g")
+      : /(?!)/;
   }
 }
 
@@ -265,10 +298,18 @@ function scanText(text, rel) {
   const lines = text.split("\n");
   for (const rule of RULES) {
     if (rule.onlyIn && !rule.onlyIn.test(rel)) continue;
-    const re = new RegExp(rule.re.source, rule.re.flags);
+    // 强制全局：非全局正则的 exec 总返回同一个匹配，零宽守卫（lastIndex++）对它无效，
+    // 会把循环变成死循环。这里把 flags 补上 g，从根上消除这一类。
+    const flags = rule.re.flags.includes("g") ? rule.re.flags : rule.re.flags + "g";
+    const re = new RegExp(rule.re.source, flags);
     let m;
+    let guard = 0; // 最后的兵：即使前两道防线都失效，也不允许无限循环把堆撑爆
     while ((m = re.exec(text))) {
+      if (++guard > 500000) break;
       const idx = m.index;
+      // 零宽匹配防卫必须放在**任何 continue 之前**：qq-number 的 continue 曾跳过它，
+      // 导致同一匹配无限重复 → 堆 5MB 涨到 2GB OOM。
+      if (re.lastIndex === idx) re.lastIndex++;
       const lineNo = text.slice(0, idx).split("\n").length;
       const raw = m[0];
       // 打码：只留前后几位，报告本身不泄露明文
@@ -276,7 +317,6 @@ function scanText(text, rel) {
       if (rule.id === "qq-number" && unlikelyQQ(raw)) continue; // 不像 QQ 号的整数，跳过
       const hit = { rule: rule.id, severity: rule.severity, desc: rule.desc, fix: rule.fix, line: lineNo, masked, file: rel };
       if (!allowed(hit, rel)) hits.push(hit);
-      if (re.lastIndex === idx) re.lastIndex++; // 防零宽死循环
     }
   }
   return hits;
@@ -287,7 +327,11 @@ const findings = [];
 for (const rel of files) {
   let text;
   try {
-    text = fs.readFileSync(path.join(ROOT, rel), "utf8");
+    // 先读 Buffer 嗅探 NUL 字节：**无扩展名的二进制**（如 strix-tui）光靠后缀拦不住，
+    // 而二进制读成 UTF-8 再跑正则会撑爆堆（见 MAX_SCAN_BYTES 处的说明）。
+    const buf = fs.readFileSync(path.join(ROOT, rel));
+    if (buf.subarray(0, 8192).includes(0)) continue;
+    text = buf.toString("utf8");
   } catch {
     continue;
   }

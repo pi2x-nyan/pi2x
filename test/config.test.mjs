@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { config, DEFAULTS, ROOT as CFG_ROOT, AGENT_DIR, WORKSPACE, SESSIONS_DIR, cfg } from "../lib/config.mjs";
+import { config, DEFAULTS, ROOT as CFG_ROOT, AGENT_DIR, WORKSPACE, SESSIONS_DIR, cfg, CONFIG_PATH } from "../lib/config.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -13,9 +13,13 @@ test("ROOT / 路径导出正确且为绝对路径", () => {
   for (const p of [AGENT_DIR, WORKSPACE, SESSIONS_DIR]) {
     assert.ok(path.isAbsolute(p), `${p} 应为绝对路径`);
   }
-  assert.equal(AGENT_DIR, path.join(ROOT, "agent-dir"));
-  assert.equal(WORKSPACE, path.join(ROOT, "workspace"));
-  assert.equal(SESSIONS_DIR, path.join(ROOT, "sessions"));
+  // 运行期目录按布局而定：private/ 启用时收进 private/，否则在仓库根（向后兼容）
+  const PRIVATE = path.join(ROOT, "private");
+  const privateOn = fs.existsSync(PRIVATE);
+  const expectDir = (name) => (privateOn ? path.join(PRIVATE, name) : path.join(ROOT, name));
+  assert.equal(AGENT_DIR, expectDir("agent-dir"));
+  assert.equal(WORKSPACE, expectDir("workspace"));
+  assert.equal(SESSIONS_DIR, expectDir("sessions"));
 });
 
 test("config 已用默认值补齐（关键字段不可能是 undefined）", () => {
@@ -68,7 +72,8 @@ test("DEFAULTS 是冻结的（防止运行期被意外改写）", () => {
 test("mergeDefaults 语义：默认值只补缺失键，不覆盖用户显式配置", async () => {
   // 通过 saveConfig 的等价逻辑间接验证：直接用导出的配置对象检查
   // config.json 里显式写过的值不能被 DEFAULTS 覆盖
-  const raw = JSON.parse(fs.readFileSync(path.join(ROOT, "config.json"), "utf8"));
+  // 走 CONFIG_PATH：private/config.json 启用后配置已不在仓库根
+  const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
   for (const [k, v] of Object.entries(raw.pi ?? {})) {
     if (typeof v === "object" && v !== null) continue;
     assert.equal(config.pi[k], v, `config.json 里的 pi.${k} 被默认值覆盖了`);

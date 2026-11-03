@@ -360,3 +360,64 @@ test("分支点必须取 leaf 链上的 compaction，不能取文件里最后一
   assert.notEqual(plan.compactionIdx, 5, "绝不能把孤儿压缩当成分支点");
   assert.equal(plan.firstKeptIdx, 3, "保留起点应是链上压缩的 firstKeptEntryId（b1）");
 });
+
+// ── 2026-10-25 事故：压缩条目全部掉链子时，绝不能退回去按文件顺序砍 ─────────
+
+/**
+ * 造一个「压缩条目全都不在 leaf 链上」的会话 —— 真实文件就是这样：
+ * 历次瘦身把压缩条目的 parentId 指向了早已删掉的节点，pi 的 buildContextEntries
+ * 沿 leaf 回溯一条都走不到，于是它压根没应用压缩，模型看的是完整历史。
+ * 此时若还按「文件里最后一条 compaction」去砍，砍掉的就是模型仍看得见的真实历史。
+ */
+function buildDetachedCompaction() {
+  const L = [];
+  L.push(JSON.stringify({ type: "session", version: 3, id: "s1", cwd: "/tmp" }));
+  const mk = (id, parentId, text) =>
+    JSON.stringify({ type: "message", id, parentId, timestamp: "2026-01-01T00:00:00.000Z", message: { role: "user", content: text } });
+  // 压缩条目排在第 2 行（文件顺序靠前），但 parentId 指向不在文件里的 gh0st
+  L.push(
+    JSON.stringify({
+      type: "compaction",
+      id: "dead-c",
+      parentId: "gh0st",
+      timestamp: "2026-01-01T00:00:01.000Z",
+      summary: "早就用不上的旧摘要",
+      firstKeptEntryId: "m1",
+      tokensBefore: 999,
+    })
+  );
+  // 真正的 leaf 链：m1 → m2 → m3，与 dead-c 无关
+  L.push(mk("m1", null, "第一条真实历史"));
+  L.push(mk("m2", "m1", "第二条真实历史"));
+  L.push(mk("m3", "m2", "第三条真实历史"));
+  return L.join("\n") + "\n";
+}
+
+test("planSlim：压缩条目全掉链子时必须拒绝瘦身（不许偷历史）", () => {
+  const text = buildDetachedCompaction();
+  const p = planSlim(text);
+  assert.equal(p.savedEntries, 0, "一条都不许丢");
+  assert.equal(p.compactionIdx, null, "不该选中任何分支点");
+  assert.match(p.reason, /没有压缩条目/);
+  assert.equal(Buffer.byteLength(p.keepLines.join("\n") + "\n", "utf8"), p.before, "keepLines 必须等于原文");
+  // 三条真实历史必须一个不少
+  const ids = p.keepLines.map((l) => JSON.parse(l).id);
+  for (const id of ["m1", "m2", "m3"]) assert.ok(ids.includes(id), `${id} 被偷走了`);
+});
+
+test("planSlim：老平面格式（全无 parentId）仍走兜底，从最后一条压缩处开始", () => {
+  // 老格式没有树结构，链长只有 1；兜底那条路对它是安全的：
+  // 平面文件里「文件最后一条 compaction」本就在唯一的线性历史里。
+  const L = [
+    JSON.stringify({ type: "session", version: 1, id: "s1", cwd: "/tmp" }),
+    JSON.stringify({ type: "message", id: "old1", parentId: null, message: { role: "user", content: "很久以前" } }),
+    JSON.stringify({ type: "compaction", id: "c9", parentId: null, summary: "摘要", firstKeptEntryId: "n1" }),
+    JSON.stringify({ type: "message", id: "n1", parentId: null, message: { role: "user", content: "压缩之后" } }),
+    JSON.stringify({ type: "message", id: "n2", parentId: null, message: { role: "user", content: "最新" } }),
+  ];
+  const plan = planSlim(L.join("\n") + "\n");
+  assert.equal(plan.compactionIdx, 2, "老格式应退回到文件里的压缩条目");
+  const ids = plan.keepLines.map((l) => JSON.parse(l).id);
+  assert.ok(!ids.includes("old1"), "压缩之前的老历史应丢弃");
+  assert.ok(ids.includes("n1") && ids.includes("n2"));
+});

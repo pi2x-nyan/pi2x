@@ -66,7 +66,17 @@ if curl -s -m 5 -o /dev/null http://127.0.0.1:20128/v1/models 2>/dev/null; then
   say "OmniRoute 已就绪"
 else
   say "启动 OmniRoute..."
-  bash <PI2X_ROOT>/scripts/omniroute-restart.sh >> "$LOG" 2>&1
+  bash /opt/new-api/start.sh >> "$LOG" 2>&1
+  bash <PI2X_ROOT>/scripts/easytier-start.sh >> "$LOG" 2>&1
+  bash /opt/tls-proxy/start.sh >> "$LOG" 2>&1
+fi
+
+# 3.5) SUSCTF 抢血通报（常驻监听各赛道事件流）
+if pgrep -f "[c]tf-blood.mjs" >/dev/null 2>&1; then
+  say "抢血通报已在运行"
+else
+  say "启动抢血通报..."
+  bash <PI2X_ROOT>/scripts/ctf-blood-start.sh >> "$LOG" 2>&1
 fi
 
 # 4) bridge（pi agent）

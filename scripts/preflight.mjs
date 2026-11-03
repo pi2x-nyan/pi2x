@@ -21,6 +21,7 @@
  * 退出码：0 = 通过，1 = 不通过
  */
 import fs from "node:fs";
+import { CONFIG_PATH, WHITELIST_PATH } from "../lib/config.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -229,7 +230,7 @@ console.log("   （下一步会真正 import 关键模块，能抓出「未声�
 
 // 3) 配置
 step("配置可解析且关键字段齐备", () => {
-  const p = path.join(ROOT, "config.json");
+  const p = CONFIG_PATH;
   const raw = JSON.parse(fs.readFileSync(p, "utf8"));
   const need = [
     ["napcat", "qqAccount"],

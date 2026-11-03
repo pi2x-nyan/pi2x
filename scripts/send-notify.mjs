@@ -7,12 +7,13 @@
  * 从 config.json 读 wsHost/wsPort/token。
  */
 import fs from "node:fs";
+import { CONFIG_PATH, WHITELIST_PATH } from "../lib/config.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, "config.json"), "utf8"));
+const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
 const ob = cfg.napcat?.onebot ?? {};
 const host = ob.wsHost ?? "127.0.0.1";
 const port = ob.wsPort ?? 3001;

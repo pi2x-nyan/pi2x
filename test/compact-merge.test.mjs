@@ -127,9 +127,12 @@ test("piagent 注册了 session_before_compact 钩子，且失败一律回退 pi
   const src = fs.readFileSync(path.join(ROOT, "lib/piagent.mjs"), "utf8");
   assert.match(src, /pi\.on\("session_before_compact"/, "必须注册钩子");
   const i = src.indexOf('pi.on("session_before_compact"');
-  const seg = src.slice(i, i + 900);
+  const seg = src.slice(i, i + 1400);
   assert.match(seg, /catch/, "钩子必须捕获异常");
   assert.match(seg, /return undefined/, "异常时必须返回 undefined（不接管）");
+  // 主动回合的静默轮马上要被回滚，压缩它纯属白烧一次摘要 —— 必须显式取消
+  assert.match(seg, /_suppressCompact/, "主动回合期间要能抑制压缩");
+  assert.match(seg, /\{ cancel: true \}/, "抑制时返回 cancel:true 取消本次压缩");
 });
 
 test("piagent 只接管时返回 compaction 三要素（summary/firstKeptEntryId/tokensBefore）", () => {

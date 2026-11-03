@@ -13,9 +13,11 @@ import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { LOGS_DIR } from "./lib/config.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const LOG_FILE = path.join(ROOT, "logs", "bridge.log");
+// 日志目录由 config 统一导出（private/logs 优先）
+const LOG_FILE = path.join(LOGS_DIR, "bridge.log");
 const IS_WIN = process.platform === "win32";
 
 /** 列出所有 bridge.mjs 进程的 PID（当前平台实现） */
@@ -110,7 +112,7 @@ function start() {
     console.log(`[ctl] bridge 已在运行: ${existing.join(", ")}，跳过（如需重启用 restart）`);
     return;
   }
-  fs.mkdirSync(path.join(ROOT, "logs"), { recursive: true });
+  fs.mkdirSync(LOGS_DIR, { recursive: true });
   const out = fs.openSync(LOG_FILE, "a");
   const child = spawn(process.execPath, [path.join(ROOT, "bridge.mjs")], {
     cwd: ROOT,

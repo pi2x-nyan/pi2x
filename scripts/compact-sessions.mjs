@@ -4,6 +4,7 @@
  * 用法: node scripts/compact-sessions.mjs [sessionFile...]  （不传参数=全部）
  */
 import fs from "node:fs";
+import { SESSIONS_DIR } from "../lib/config.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -19,7 +20,7 @@ import { makeSettingsManager } from "../lib/agent/settings.mjs";
 const log = createLogger("compact-cli");
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const SESSIONS_DIR = path.join(ROOT, "sessions");
+// SESSIONS_DIR 由 config.mjs 统一导出（private/sessions 优先）
 
 const targets = process.argv.slice(2);
 

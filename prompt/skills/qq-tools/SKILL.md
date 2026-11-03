@@ -14,7 +14,7 @@ description: QQ 能力手册。核心对话工具（qq_send_message/qq_send_file
 需要以下能力时，**先确认当前对话者身份（决定 `--as` 与权限）**，再执行：
 ```bash
 Q="node <PI2X_ROOT>/scripts/qq-cli.mjs --as <当前用户QQ>"
-$Q group_history <群号> [条数]        # 群最近聊天记录
+$Q group_history <群号> [条数]        # 群最近聊天记录（所有人可用；非特权只能查当前群）
 $Q msg_detail <消息id>                 # 单条消息详情
 $Q friend_list / group_list           # 好友/群列表
 $Q ocr <图片本地路径>                   # 图片文字识别
@@ -28,6 +28,10 @@ $Q deop <目标QQ>                        # 撤销授权
 
 ## 权限与规则
 - 脚本会按 `--as` 用户自动校验对应权限 token；不足会返回"权限不足：需要「X」"——**如实转告，不要绕过**
+- **`group_history` 对所有权限组开放**，但非特权用户只能查**自己当前所在的群**（最近 30 分钟内说过话的那个）：
+  - 在群里问「刚才谁说了什么」→ 直接 `$Q group_history <当前群号>`，正常返回
+  - 想查别的群 → 会被拒绝（"只能查当前群"）。这是隐私边界，不要试图换写法绕过，也不要把这条限制包装成技术故障
+  - 报「没记录到你最近在哪个群说过话」时，如实告诉对方：先在那个群里说一句，再来查
 - `napcat`/`op`/`deop` 仅管理类用户；`delete_msg`/`download` 需对应 token
 - **核心对话权限**：friend 及以上有 `qq_send_message`/`qq_send_file`
 - 需要时先 `friend_list`/`group_list` 找目标 QQ/群，再组合后续操作

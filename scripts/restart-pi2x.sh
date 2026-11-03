@@ -17,10 +17,20 @@
 #   这里原先把参数解析放在 pkill 之后，导致手工用 `--print-target` 做参数自测时，
 #   脚本已经把 bridge 杀了 —— 连续自测 = 连续自杀重启，把调用方（agent 自己）卡死。
 #   「只读模式必须最先返回」这条不是洁癖，是血的教训。
+#
+#   另一条（2026-09-21）：本脚本必须先**自我脱离父进程树**再 pkill，
+#   否则会被 bridge 退出时的进程树清理一并强杀，永远走不到「拉起新进程」。
+#   详见下方 0.5) 段落。
 # ─────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 运行期目录解析（private/ 优先，否则旧布局）—— 见 scripts/private-paths.sh
+PI2X_ROOT="$ROOT_DIR"
+# shellcheck source=/dev/null
+source "$ROOT_DIR/scripts/private-paths.sh"
+LOG_DIR="$P_LOGS_DIR"
+STATE_DIR_S="$P_STATE_DIR"
 
 # ── 0) 参数解析（只读，先于一切副作用）────────────────────────────────────
 #   $1 = private|group（可省，默认 private）  $2 = QQ号/群号
@@ -57,6 +67,36 @@ if [ "$ONLY_READ" = "1" ]; then
   exit 0
 fi
 
+# ── 0.5) 自我脱离父进程树（**关键修复**，改动前请先读）──────────────────
+#
+# 【为什么必须做】本脚本会在多种进程树里被调用：
+#   · /restart 内置命令（spawn detached）
+#   · agent 的 bash 工具 —— 此时脚本是 bridge 的**子孙进程**
+#   · cron / 手工执行
+# 而第 3 步要 pkill 掉 bridge。若调用者是 bridge 的子孙，bridge 退出时
+# 进程树清理（SDK 的 killProcessTree：SIGTERM→SIGKILL）会把**本脚本一并杀掉**。
+#
+# 【真实事故 2026-09-21 01:05】从 bash 工具调用本脚本：
+#   01:05:13.5 写完重启锁 → 01:05:14.7 bridge 收到 SIGTERM（pkill 生效）
+#   → 脚本随即被强杀（证据：锁文件残留，说明 trap 没执行到；
+#     输出也停在「已创建回滚点」，从未走到第 4 步「拉起新进程」）
+#   → 没有任何新进程 → 01:07:01 看门狗兜底拉起，
+#     用户收到的是「🔧 被看门狗自动拉起」而不是「已重启完成」。
+#
+# 【修法】先把自己挪进**独立会话**（setsid：新 session + 新进程组），
+# 与调用者的进程树彻底脱钩，之后无论谁死都影响不到本脚本。
+# 顺带把输出落到带时间戳的日志里，便于事后取证。
+if [ "${PI2X_RESTART_DETACHED:-0}" != "1" ]; then
+  mkdir -p "$LOG_DIR" 2>/dev/null
+  LOGF="$LOG_DIR/restart-$(date +%Y%m%d-%H%M%S).log"
+  SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  export PI2X_RESTART_DETACHED=1
+  export PI2X_RESTART_CHAT="$Chat" PI2X_RESTART_TARGET="$Target" PI2X_RESTART_UID="$Uid"
+  setsid nohup bash "$SELF" "$@" > "$LOGF" 2>&1 < /dev/null &
+  echo "[restart] 已脱离父进程树（独立会话），日志：$LOGF"
+  exit 0
+fi
+
 cd "$ROOT_DIR" || exit 1
 export PATH=/usr/local/bin:/usr/bin:/bin
 
@@ -66,12 +106,12 @@ log() { echo "[restart] $*"; }
 # 核心保险：宁可不重启（旧进程还能服务），也不要拉起一个起不来的新进程。
 if [ "$SKIP_CHECK" = "0" ]; then
   log "冒烟检查：语法 + 模块导入 + 快速测试（跳过用 --no-check）"
-  if ! node scripts/preflight.mjs >> logs/preflight.log 2>&1; then
+  if ! node scripts/preflight.mjs >> "$LOG_DIR/preflight.log" 2>&1; then
     log "❌ 冒烟检查未通过，已**拒绝重启**（旧进程继续服务）。"
-    log "   详情：logs/preflight.log"
-    tail -n 20 logs/preflight.log | sed 's/^/   | /'
+    log "   详情：$LOG_DIR/preflight.log"
+    tail -n 20 "$LOG_DIR/preflight.log" | sed 's/^/   | /'
     if [ -n "$Uid" ]; then
-      node scripts/send-notify.mjs "$Uid" "⚠️ 重启已中止：改动未通过冒烟检查，旧版本继续运行。详情见 logs/preflight.log" 2>/dev/null
+      node scripts/send-notify.mjs "$Uid" "⚠️ 重启已中止：改动未通过冒烟检查，旧版本继续运行。详情见 $LOG_DIR/preflight.log" 2>/dev/null
     fi
     exit 1
   fi
@@ -101,10 +141,18 @@ PREV_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo "")"
 # 锁的语义（**不是**「锁存在就一直跳过」）：
 #   · 看门狗只在**第一次**看到这把锁时跳过一轮，并把 lockId 记进 state/restart.lock.seen；
 #   · 第二轮起即便锁还在，它也照常探活 —— 一把残留死锁不该让探活永久失效。
+#
+# ⚠ 【锁只买来 2 分钟，别把“兜底”当主路】
+# 上面这条语义意味着：看门狗最多容忍 2 个巡检周期。若脚本在这期间没把新进程拉起来
+# （例如被强杀、冒烟不过、回滚中），看门狗下一轮就会接管并抢着拉起 ——
+# 用户看到的就是「被看门狗自动拉起」。这本身是**正确的兜底**，不是故障；
+# 但正常重启路径应尽量不触发它：
+#   · 脚本自我脱离进程树（0.5 段）—— 防止被连坐强杀；
+#   · 冒烟检查放在最前 —— 不通过就拒绝重启，旧进程继续服务。
 # 于是等价于「重启最多被容忍 120 秒」（config.lifecycle.restartLockTtlMs）：
 # 锁过期后看门狗立刻接管；脚本被 kill、锁没清掉，也不会挡住探活。
-LOCK="$ROOT_DIR/state/restart.lock"
-mkdir -p "$ROOT_DIR/state" 2>/dev/null
+LOCK="$STATE_DIR_S/restart.lock"
+mkdir -p "$STATE_DIR_S" 2>/dev/null
 # ⚠ 时间戳必须用**毫秒**（`date +%s%3N`），不能是 `date +%s`（秒）。
 # 看门狗那边用 Node 的 Date.now()（毫秒）做差值；量纲不一致会差 1000 倍，
 # 于是刚写的锁被判定「过期 56 年」形同虚设 —— 踩过一次（2026-09-13）。
@@ -123,13 +171,13 @@ done
 source /etc/profile.d/deepseek.sh 2>/dev/null
 source /etc/profile.d/cred.sh 2>/dev/null
 # 记录本次启动时日志的行数，用于只判断「新启动」是否成功
-LOGLINES_BEFORE=$(wc -l < logs/bridge.log 2>/dev/null || echo 0)
-nohup node bridge.mjs >> logs/bridge.log 2>&1 &
+LOGLINES_BEFORE=$(wc -l < "$LOG_DIR/bridge.log" 2>/dev/null || echo 0)
+nohup node bridge.mjs >> "$LOG_DIR/bridge.log" 2>&1 &
 disown 2>/dev/null
 
 READY=0
 for _ in $(seq 1 25); do
-  if tail -n +"$((LOGLINES_BEFORE + 1))" logs/bridge.log 2>/dev/null | grep -q 'pi agent 就绪'; then
+  if tail -n +"$((LOGLINES_BEFORE + 1))" "$LOG_DIR/bridge.log" 2>/dev/null | grep -q 'pi agent 就绪'; then
     READY=1
     break
   fi
@@ -142,13 +190,13 @@ done
 if [ "$READY" != "1" ]; then
   log "❌ 新进程启动失败（未出现「pi agent 就绪」）"
   log "   最近日志："
-  tail -n 25 logs/bridge.log | sed 's/^/   | /'
+  tail -n 25 "$LOG_DIR/bridge.log" | sed 's/^/   | /'
   if [ -n "$PREV_SHA" ] && [ -x scripts/rescue.mjs ] || [ -f scripts/rescue.mjs ]; then
     log "→ 调用救援脚本自动回滚…"
     node scripts/rescue.mjs auto-rollback 2>&1 | sed 's/^/   | /'
   fi
   if [ -n "$Uid" ]; then
-    node scripts/send-notify.mjs "$Uid" "⚠️ PI2X 重启失败，已尝试自动回滚（回滚点 ${PREV_SHA:-无}）。详情见 logs/bridge.log" 2>/dev/null
+    node scripts/send-notify.mjs "$Uid" "⚠️ PI2X 重启失败，已尝试自动回滚（回滚点 ${PREV_SHA:-无}）。详情见 $LOG_DIR/bridge.log" 2>/dev/null
   fi
   exit 1
 fi

@@ -5,13 +5,14 @@
  * 供 napcat-watchdog.sh 使用。
  */
 import fs from "node:fs";
+import { CONFIG_PATH, WHITELIST_PATH } from "../lib/config.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 let ob = {};
-try { ob = JSON.parse(fs.readFileSync(path.join(ROOT, "config.json"), "utf8")).napcat?.onebot ?? {}; } catch {}
+try { ob = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")).napcat?.onebot ?? {}; } catch {}
 const host = ob.wsHost ?? "127.0.0.1";
 const port = ob.wsPort ?? 3001;
 const token = ob.token ?? "";

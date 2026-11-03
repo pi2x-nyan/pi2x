@@ -14,12 +14,13 @@
  *   --json             输出 JSON
  */
 import fs from "node:fs";
+import { SESSIONS_DIR } from "../lib/config.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { survey, slimFile, archiveStale, sweepOrphans } from "../lib/sessions-maint.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const SESSIONS = path.join(ROOT, "sessions");
+const SESSIONS = SESSIONS_DIR;   // 由 config 统一导出（private/sessions 优先）
 
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(f);

@@ -92,3 +92,43 @@ test("扫描器会把历史提交一起算上（能从历史里发现泄露）",
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── 死循环防线（2026-09-23 OOM 事故） ─────────────────────────────────────
+//
+// 事故链条：目录重构把私有词表搬到 private/.private-terms，而扫描器仍读
+// ROOT/.private-terms → ENOENT → 回退成兜底正则 /$^/。而 /$^/ 有两个致命点：
+//   ① 它会匹配**空字符串**（所以前面 133 个文件都正常，扫到 0 字节文件才引爆）；
+//   ② 它没有 g 标志 → 非全局正则的 exec 永远返回同一个匹配，lastIndex++ 守卫无效
+//      → 死循环，堆从 5MB 一路涨到 2GB OOM（回归测试因此失败，且症状是子进程
+//      「Ineffective mark-compacts near heap limit」而非断言失败，极难归因）。
+// 下面三条把这三处重新焊死。
+
+test("扫描器：兜底正则必须永不匹配，不得再用 /$^/", () => {
+  // 先剥掉注释：源码注释里会拿 /$^/ 当反面例子讲述这次事故，
+  // 直接 includes 会把“注释里的字面”当成“代码里的使用”，自己绊自己。
+  const code = fs
+    .readFileSync(SCAN, "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "")
+    .replace(/\/\/.*$/gm, "");
+  assert.ok(!code.includes("/$^/"), "又出现 /$^/ 兜底正则：它匹配空串且无 g → 死循环 OOM（应用 /(?!)/）");
+});
+
+test("扫描器：私有词表必须从 private/ 读取（重构后原路径已不存在）", () => {
+  const src = fs.readFileSync(SCAN, "utf8");
+  assert.match(src, /private\/\.private-terms/, "词表路径未包含 private/：重构后读不到，real-name 规则会静默失效");
+});
+
+test("扫描器：正则循环必须强制带 g 标志（非全局正则会死循环）", () => {
+  const src = fs.readFileSync(SCAN, "utf8");
+  assert.match(src, /includes\("g"\)\s*\?/, "未强制补 g 标志：非全局正则 exec 不推进 lastIndex → 死循环");
+});
+
+test("扫描器：零宽守卫必须在 continue 之前（否则 qq-number 跳过守卫致死循环）", () => {
+  const src = fs.readFileSync(SCAN, "utf8");
+  const guard = src.indexOf("if (re.lastIndex === idx) re.lastIndex++");
+  const cont = src.indexOf("unlikelyQQ(raw)) continue");
+  assert.ok(guard > 0, "找不到零宽守卫");
+  assert.ok(cont > 0, "找不到 qq-number 的 continue");
+  assert.ok(guard < cont, "零宽守卫在 continue 之后 → qq-number 命中时跳过守卫 → 同一匹配无限重复 → OOM");
+});

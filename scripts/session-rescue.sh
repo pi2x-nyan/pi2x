@@ -18,6 +18,11 @@
 #
 # 例：
 #   bash scripts/session-rescue.sh private_<QQ> <QQ>
+
+# 运行期目录（private/ 优先）
+PI2X_ROOT="${PI2X_ROOT:-<PI2X_ROOT>}"
+# shellcheck source=/dev/null
+source "$PI2X_ROOT/scripts/private-paths.sh" 2>/dev/null || P_LOGS_DIR="$PI2X_ROOT/logs"
 set -uo pipefail
 
 ROOT_DIR="<PI2X_ROOT>"
@@ -80,13 +85,13 @@ log "处理后: $(echo "scale=2; $AFTER/1048576" | bc)MB"
 
 # ── 5) 起进程 ────────────────────────────────────────────────────────
 log "启动 bridge…"
-LOGLINES=$(wc -l < logs/bridge.log 2>/dev/null || echo 0)
-nohup node bridge.mjs >> logs/bridge.log 2>&1 &
+LOGLINES=$(wc -l < "$P_LOGS_DIR"/bridge.log 2>/dev/null || echo 0)
+nohup node bridge.mjs >> "$P_LOGS_DIR"/bridge.log 2>&1 &
 disown 2>/dev/null
 
 READY=0
 for _ in $(seq 1 30); do
-  if tail -n +"$((LOGLINES + 1))" logs/bridge.log 2>/dev/null | grep -q 'pi agent 就绪'; then
+  if tail -n +"$((LOGLINES + 1))" "$P_LOGS_DIR"/bridge.log 2>/dev/null | grep -q 'pi agent 就绪'; then
     READY=1; break
   fi
   pgrep -f 'bridge[.]mjs' >/dev/null 2>&1 || break
@@ -100,9 +105,9 @@ if [ "$READY" = "1" ]; then
   fi
 else
   log "❌ 启动失败，最近日志："
-  tail -n 20 logs/bridge.log | sed 's/^/   | /'
+  tail -n 20 "$P_LOGS_DIR"/bridge.log | sed 's/^/   | /'
   if [ -n "$NOTIFY_TO" ]; then
-    node scripts/send-notify.mjs "$NOTIFY_TO" "⚠️ 会话急救后 bridge 未就绪，需人工检查 logs/bridge.log" 2>/dev/null
+    node scripts/send-notify.mjs "$NOTIFY_TO" "⚠️ 会话急救后 bridge 未就绪，需人工检查 "$P_LOGS_DIR"/bridge.log" 2>/dev/null
   fi
   exit 1
 fi
@@ -110,5 +115,5 @@ fi
 # ── 6) 报告新上下文规模 ─────────────────────────────────────────────
 log "等 20s 让首轮统计落盘…"
 sleep 20
-grep -E "上下文|compact" logs/bridge.log | tail -3 | sed 's/^/   /'
+grep -E "上下文|compact" "$P_LOGS_DIR"/bridge.log | tail -3 | sed 's/^/   /'
 exit 0
