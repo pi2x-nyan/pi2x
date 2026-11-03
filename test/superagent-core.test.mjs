@@ -118,3 +118,14 @@ test("ticketView: 给模型看的字段齐全", () => {
   const v = ticketView(t);
   for (const k of ["id", "title", "stage", "action", "report", "needs", "inputs"]) assert.ok(k in v);
 });
+
+test("worker 工具集：没有任何对外通道，只有汇报", async () => {
+  const { buildTools } = await import("../lib/tools/index.mjs");
+  // 模拟 worker：admin 权限 + 绑定某个工单
+  const tools = buildTools({ me: { tickets: null }, perms: new Set(["files:full", "tools.run_task", "tools.qq_send_file"]), userId: "sub", ticketId: "tkt-test" });
+  const names = tools.map((t) => t.name);
+  assert.ok(names.includes("task_report"), "worker 必须有 task_report");
+  assert.ok(!names.includes("qq_send_message"), "worker 不该能直接给用户发消息");
+  assert.ok(!names.includes("qq_send_file"), "worker 不该能直接发文件");
+  assert.ok(!names.includes("run_task"), "worker 不该再派活");
+});

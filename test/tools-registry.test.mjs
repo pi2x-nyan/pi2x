@@ -79,7 +79,9 @@ test("ORDER 必须覆盖所有产出工具（防止新增工具被静默丢弃�
   assert.deepEqual(missing, [], `这些工具没登记进 ORDER：${missing.join(", ")}`);
   // 反向：ORDER 里不该有本模块永远不产出、且不在预留清单里的名字
   const produced = new Set(names);
-  const never = ORDER.filter((n) => !produced.has(n));
+  // 条件工具：只在特定会话里生成，正常构建时"产不出来"是设计如此
+  const CONDITIONAL = new Set(["task_report"]);
+  const never = ORDER.filter((n) => !produced.has(n) && !CONDITIONAL.has(n));
   assert.deepEqual(never, [], `ORDER 里有永远产不出的名字：${never.join(", ")}`);
 });
 

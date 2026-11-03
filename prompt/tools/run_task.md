@@ -25,3 +25,9 @@ label: 子代理执行（subagent，异步 · 完成即唤醒）
 
 - 优先 Windows 侧代理（拥有网页搜索、浏览器、截图、UI 自动化等能力）；Windows 不可达时回退本机 Linux 代理。
 - 参数 `timeout`（秒）为必须显式指定的超时上限（上限 600）。
+
+## worker 没有对外通道
+
+子代理（worker）拿不到 `qq_send_message` / `qq_send_file`，也不能再派活。它只能用 `task_report` 把进展写回工单，由我在主线程转述。
+
+所以派活时把「要报什么」写进任务描述里：让它阶段性地 task_report，而不是期待它直接找你。
