@@ -13,6 +13,7 @@ import fs from "node:fs";
 import { proactiveConfig, loadState, shouldRun, recordSent, recordSkip } from "./lib/proactive.mjs";
 import { loadEvents, markConsumed, loadWatch, checkFiles, checkUrls } from "./lib/events.mjs";
 import { drainNotes, requeueNotes } from "./lib/notes.mjs";
+import { systemWakeConfig, resolveWakeChat, createSystemWake, makePiSessionSubmit } from "./lib/system-wake.mjs";
 import { buildTrigger, strengthOf, appendDisposition } from "./lib/trigger.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +38,8 @@ const logRecv = createLogger("recv");
 const logReply = createLogger("reply");
 const logErr = createLogger("error");
 const logShutdown = createLogger("shutdown");
+/* 系统唤醒（外部事件 → Router）单独一个 scope，方便 grep 事件链路 */
+const logWake = createLogger("system-wake");
 /* strix 框架会话的收发日志（与 pi 主链路分开，排查时一眼能分辨走的是哪个框架） */
 const logSxRecv = createLogger("strix-recv");
 const logSxErr = createLogger("strix-error");
@@ -386,6 +389,45 @@ try {
     t.unref?.();
     process.on("SIGTERM", () => clearInterval(t));
     logBoot.info(`主动回合已启动：${pcfg.chats.join(",") || "(无会话)"}，间隔 ${pcfg.intervalMinutes} 分钟，每日上限 ${pcfg.dailyMax}`);
+  }
+}
+
+// ---------- 4.7b 系统唤醒（外部事件 → Router） ----------
+// 4.7 的主动回合开关一关，事件队列就彻底没人消费了：挂课看门狗/磁盘告警把事写进
+// 队列，Router 永远不知道（2026-11-04 挂课卡死 17 小时，事件链路完全没参与）。
+// 这里独立轮询，与 proactive 开关无关；节流与每日额度在 lib/system-wake.mjs。
+{
+  const swCfg = systemWakeConfig(config.pi?.systemWake);
+  const swChat = resolveWakeChat(swCfg, config.pi?.proactive?.chats);
+  if (!swCfg.enabled) {
+    logWake.info("系统唤醒：未启用（config.pi.systemWake.enabled=false）");
+  } else if (!swChat) {
+    logWake.warn("系统唤醒：没有唤醒目标会话（config.pi.systemWake.chat），通道不启动");
+  } else {
+    // 复用 _wakeSubDone 的提交方式：会话空闲 → triggerTurn 开新一轮；正忙 → steer 注入。
+    const submit = makePiSessionSubmit(pi);
+    const wake = createSystemWake({ cfg: swCfg, chatKey: swChat, submit, logger: logWake });
+    let busy = false;
+    const tick = async () => {
+      // 唤醒可能走完一整轮（几分钟），期间不叠第二次
+      if (busy) return;
+      busy = true;
+      try {
+        await wake.tick();
+      } catch (e) {
+        logWake.warn(`系统唤醒异常：${e?.message}`);
+      } finally {
+        busy = false;
+      }
+    };
+    const t = setInterval(tick, swCfg.intervalSec * 1000);
+    t.unref?.();
+    process.on("SIGTERM", () => clearInterval(t));
+    setTimeout(tick, 10_000); // 启动后先扫一次，把重启期间积压的事件接上
+    logWake.info(
+      `系统唤醒通道已启动：${swChat}，每 ${swCfg.intervalSec} 秒，类型 ${swCfg.types.join("/")}，` +
+        `同 key ${swCfg.throttleMinutes} 分钟一次，每日上限 ${swCfg.dailyMax}`,
+    );
   }
 }
 

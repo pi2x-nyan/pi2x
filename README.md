@@ -59,8 +59,7 @@ PI2X/
 │   ├── skills/                  # 技能手册（按需 read 全文）
 │   ├── tools/*.md               # 各工具的描述（label + description）
 │   ├── memory/                  # 记忆收割 / 反思提示词
-│   ├── reviewer/ · risk/        # 风险评审提示词
-│   └── context/2x.md            # 人格设定（本地私有，公开版自动剥离）
+│   └── reviewer/ · risk/        # 风险评审提示词
 ├── scripts/                # 运维与工具脚本（34 个）
 │   ├── preflight.mjs            # 冒烟检查（语法 + import + 配置 + 测试门禁）
 │   ├── restart-pi2x.sh          # 带保险的重启（先检查后杀进程）
@@ -68,7 +67,7 @@ PI2X/
 │   ├── mode.mjs · rollback.mjs  # 模式切换与回滚
 │   ├── sessions-maint.mjs       # 会话瘦身 / 归档
 │   ├── scan-secrets.mjs         # 敏感信息扫描（推送前门禁）
-│   ├── export-public.mjs        # 导出公开版（剥离人设与隐私）
+│   ├── export-public.mjs        # 导出公开版（剥离隐私信息）
 │   ├── qq-cli.mjs               # QQ 查询/管理能力（渐进披露）
 │   ├── browser-cli.mjs          # 无头浏览器
 │   ├── memory-cli.mjs           # 记忆运维（校准 / 探针 / 反思）

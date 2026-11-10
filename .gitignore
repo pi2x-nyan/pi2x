@@ -45,3 +45,7 @@ __pycache__/
 # 把索引撑到 1.87 万文件，进而让 scan-secrets 的 git ls-files 报 ENOBUFS、
 # 回退到遍历又扫到 private/ 密钥，冒烟失败导致重启被拒。
 tmp/
+
+# 用户产物（实验报告、下载件等）不进仓库，只留 README
+workspace/*
+!workspace/README.md

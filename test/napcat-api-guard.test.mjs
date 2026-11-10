@@ -29,7 +29,7 @@ function sources(dir, out = []) {
   const skip = new Set(["node_modules", ".git", "tmp", "sandbox", "workspace", "logs", "state", "sessions", "agent-dir", "napcat", "test"]);
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     if (skip.has(e.name) || e.name.startsWith(".")) continue;
-    // 跳过其它测试生成的临时副本（persona-single / perm-block-routing 会把
+    // 跳过其它测试生成的临时副本（perm-block-routing 会把
     // piagent.mjs 复制成 lib/__piagent_*.mjs 来加载）。这些副本含同样的
     // `.api(var, …)` 危险点，但不属于"源码里的新增位置"；更麻烦的是它们只在
     // 那两条测试运行期间存在 —— 并发跑时本测试会偶发扫到，造成随机失败。

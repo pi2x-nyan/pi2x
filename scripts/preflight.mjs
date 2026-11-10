@@ -123,15 +123,23 @@ function criticalModules() {
  */
 function healExtensionPeers() {
   const nmRoot = "/root/.pi/agent/npm/node_modules";
+  // 源路径要按版本试：pi-coding-agent 0.x 把 pi-ai / pi-tui 收在自己的
+  // node_modules 下，1.x 起提升到了顶层。两种布局都认，免得升级一次就断链。
   const peers = [
-    ["@earendil-works/pi-coding-agent", `${ROOT}/node_modules/@earendil-works/pi-coding-agent`],
+    ["@earendil-works/pi-coding-agent", [`${ROOT}/node_modules/@earendil-works/pi-coding-agent`]],
     [
       "@earendil-works/pi-ai",
-      `${ROOT}/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai`,
+      [
+        `${ROOT}/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai`,
+        `${ROOT}/node_modules/@earendil-works/pi-ai`,
+      ],
     ],
     [
       "@earendil-works/pi-tui",
-      `${ROOT}/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui`,
+      [
+        `${ROOT}/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui`,
+        `${ROOT}/node_modules/@earendil-works/pi-tui`,
+      ],
     ],
   ];
   // 没有装扩展就没什么可修的
@@ -139,10 +147,11 @@ function healExtensionPeers() {
   const linkRoot = path.join(nmRoot, "@earendil-works");
   const fixed = [];
   const missing = [];
-  for (const [name, target] of peers) {
+  for (const [name, targets] of peers) {
     const short = name.split("/").pop();
     const link = path.join(linkRoot, short);
-    if (!fs.existsSync(target)) {
+    const target = targets.find((t) => fs.existsSync(t));
+    if (!target) {
       missing.push(`${short}(源不存在)`);
       continue;
     }

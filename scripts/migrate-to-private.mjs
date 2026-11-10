@@ -48,9 +48,6 @@ const PLAN = [
   [".napcat-offline-count", ".napcat-offline-count"],
   ["win-agent/config.json", "win-agent/config.json"],
 
-  // ── 人设（作者的私人设定）──
-  ["prompt/context/2x.md", "persona/2x.md"],
-
   // ── 运行期目录 ──
   ["sessions", "sessions"],
   ["state", "state"],

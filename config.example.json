@@ -17,16 +17,13 @@
   "pi": {
     "workspace": "./workspace",
     "agentDir": "./agent-dir",
+    "persona": {
+      "enabled": false,
+      "cardFile": "./private/persona/card.json"
+    },
     "replyTimeoutMs": 180000,
     "maxReplyChars": 1500,
     "model": "<provider>/<model-id>，例如 omniroute/deepseek-flash",
-    "persona": {
-      "default": {
-        "enabled": false,
-        "_comment": "把统一人设提示词放到 prompt/context/ 下，再把 enabled 改为 true。公开仓库不含任何具体人设。",
-        "promptFile": "<人设文件名>.md"
-      }
-    },
     "streamReplies": true,
     "submitTimeoutMs": 600000,
     "streamFlushMin": 80,
@@ -48,6 +45,7 @@
   "memory": {
     "enabled": true,
     "dbPath": "./workspace/memories/memory.db",
+    "addressing": {},
     "modelDir": "./workspace/memories/models",
     "sandboxDir": "./sandbox",
     "harvestIntervalMin": 0,

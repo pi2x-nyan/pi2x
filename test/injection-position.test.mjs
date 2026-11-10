@@ -102,7 +102,6 @@ test("before_agent_start 的注入必须都是「同一会话内稳定」的内�
   // system 里一旦有逐轮变化的内容，分叉点之后（整段历史）的缓存全部作废。
   //
   // 允许进 system：
-  //   · 人设（同一用户恒定）
   //   · 权限白名单 permBlockSys（同一私聊对象权限稳定；admin 私聊时为空串）
   // 必须留报文末尾（逐轮变化）：
   //   · 记忆检索结果 memInjection
@@ -118,7 +117,6 @@ test("before_agent_start 的注入必须都是「同一会话内稳定」的内�
   assert.doesNotMatch(seg, /riskNote/, "风险研判进了 system prompt —— 它只对当次请求有效且逐次变化");
   assert.doesNotMatch(seg, /permBlockTail/, "群聊白名单进了 system prompt —— 群内说话人可能变化");
 
-  assert.match(seg, /persona/, "人设应仍在 system 中注入");
   assert.match(seg, /permBlockSys/, "私聊权限白名单应并入 system（权限稳定，不破坏缓存）");
 });
 

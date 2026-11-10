@@ -3,13 +3,12 @@
  * 导出公开版 —— 从本地仓库生成可安全发布的快照
  *
  * 【为什么需要独立导出，而不是直接 push 本地仓库】
- * 本地仓库是「完整版」：含本机配置、真人设、运维脚本里的一些部署信息。
- * 公开仓库需要的是另一份东西 —— 剥离了人设与所有身份/密钥信息的源码快照。
- * 两者内容不同、目的不同，混在一个仓库里迟早出错（一个手滑 push 就把人设公开了），
+ * 本地仓库是「完整版」：含本机配置、运维脚本里的一些部署信息。
+ * 公开仓库需要的是另一份东西 —— 剥离了身份与所有密钥信息的源码快照。
+ * 两者内容不同、目的不同，混在一个仓库里迟早出错（一个手滑 push 就把密钥公开了），
  * 所以物理隔离：本地仓库照常开发，公开版由本脚本生成。
  *
  * 【剥什么、为什么】
- *   prompt/context/2x-*.md   人设提示词 —— 属于作者的创作与私人设定，不随代码公开
  *   config.json / whitelist.json / .cc-pool.json / win-agent/config.json
  *                            含密钥与真实 QQ，改由 *.example.json 提供模板
  *   真实姓名、内网 IP、主机名、真实 QQ   —— 身份与拓扑信息
@@ -44,10 +43,6 @@ const SKIP_SCAN = ARGS.includes("--skip-scan");
 
 /** 不进入公开版的文件 */
 const EXCLUDE_PATTERNS = [
-  // 人设提示词（作者的私人设定）。
-  // 注意匹配的是 `2x`（不带横线）：统一人设后文件名为 2x.md，
-  // 若仍写成 /^prompt\/context\/2x-/ 就会漏掉它、把私人人设导出到公开仓库。
-  /^prompt\/context\/2x/,
   // 重构记录 REFACTOR-*.md：含大量本机部署细节、真实路径与排障过程
   // （包括密钥排查痕迹），按用户要求不上传公开仓库，仅本地保留。
   /^REFACTOR-.*\.md$/,
@@ -64,8 +59,6 @@ const EXCLUDE_PATTERNS = [
 
 /** 内容改写：把身份信息与本地设定换成通用说法 */
 const REWRITES = [
-  { file: /^config\.example\.json$/, from: /"2x"\s*:/g, to: '"default":' },
-  { file: /^lib\/config\.mjs$/, from: /persona\.2x|"2x"/g, to: "persona" },
   { file: /\.(md|mjs|json|sh|ps1)$/, from: /<创建者>/g, to: "<创建者>" },
   // 本机部署路径归一化。
   //

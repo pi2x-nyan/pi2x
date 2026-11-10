@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+/**
+ * 挂课看门狗 —— 不需要我一直轮询，出事了它把我叫醒
+ *
+ * 判据（每 5 分钟看一次）：
+ *   · tmp/mooc/STOPPED 出现      → 挂课被拦下，必须告诉我
+ *   · loop 进程没了              → 崩了或跑完了
+ *   · state.json 超过 15 分钟没更新 → 卡死
+ *   · 任务点数字涨了             → 只记状态文件，不打扰（每小时最多报一次进度）
+ *
+ * 防刷屏（2026-11-03 修）：
+ *   · STOPPED 内容算 md5，hash 不变就不再报（同一个停机状态只报一次）
+ *   · 「状态 N 分钟没更新」同一个分钟数值每小时最多报 1 次，且累计超过 3 次就不再报
+ *   · 「loop 进程没了」要连续 2 次检查都不在才报（避免刚好在轮次间隙误报）
+ *
+ * 通知走 lib/notes.mjs 的便条队列，由 bridge 用自己的句柄落进会话，
+ * 不跟它抢会话文件。
+ */
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { enqueueNote } from "../lib/notes.mjs";
+
+const ROOT = "/opt/pi2x";
+const DIR = path.join(ROOT, "tmp/mooc");
+const STATE = path.join(DIR, "state.json");
+const STOP = path.join(DIR, "STOPPED");
+const LAST = path.join(DIR, "watcher.json");
+
+const STALL_REPORT_MAX = 3;          // 同一个停滞时长值最多报 3 次
+const STALL_REPORT_GAP_MS = 60 * 60_000; // 同一个停滞时长值每小时最多报 1 次
+
+const now = Date.now();
+const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } };
+const last = readJson(LAST) ?? {};
+if (!last.alertedStops) last.alertedStops = {};   // { <md5>: at } 已报过的 STOPPED
+if (!last.stall) last.stall = { key: null, count: 0, at: 0 };
+if (!last.loopMiss) last.loopMiss = 0;
+
+const st = readJson(STATE);
+if (!st) process.exit(0);   // 没有状态文件 = 没在挂课，什么也不做
+
+const alerts = [];
+
+/* ---------------------------- 1. STOPPED：同内容只报一次 ---------------------------- */
+if (fs.existsSync(STOP)) {
+  let body = "";
+  try { body = fs.readFileSync(STOP, "utf8").trim(); } catch {}
+  const hash = crypto.createHash("md5").update(body).digest("hex");
+  const seen = last.alertedStops[hash];
+  if (!seen) {
+    alerts.push(`挂课已停止：${body.replace(/\s+/g, " ").slice(0, 300)}`);
+    last.alertedStops[hash] = now;
+    last.lastStopHash = hash;
+  }
+  // 只留最近 20 条 hash，别让文件无限长
+  const keys = Object.keys(last.alertedStops);
+  if (keys.length > 20) {
+    keys.sort((a, b) => (last.alertedStops[a] || 0) - (last.alertedStops[b] || 0));
+    for (const k of keys.slice(0, keys.length - 20)) delete last.alertedStops[k];
+  }
+}
+
+/* ------------------------- 2. loop 进程：连续 2 次没了才报 ------------------------- */
+let alive = false;
+try {
+  const { execSync } = await import("node:child_process");
+  const out = execSync("pgrep -fa 'mooc-loop.sh' || true", { encoding: "utf8" });
+  alive = out.split("\n").some((l) => l.includes("mooc-loop.sh") && !l.includes("pgrep"));
+} catch { /* 查不到就当没活 */ }
+
+if (!alive) {
+  last.loopMiss = (last.loopMiss || 0) + 1;
+  if (last.loopMiss >= 2 && !fs.existsSync(STOP) && !last.loopGoneReported) {
+    alerts.push("挂课的 loop 进程连续两次检查都不在了（崩溃或被停）");
+    last.loopGoneReported = true;
+  }
+} else {
+  last.loopMiss = 0;
+  last.loopGoneReported = false;
+}
+
+/* ------------- 3. 状态不更新：同一数值每小时 1 次、累计 3 次封顶 ------------- */
+const updated = Date.parse(String(st.updatedAt ?? "").replace(" ", "T"));
+if (Number.isFinite(updated) && now - updated > 15 * 60 * 1000) {
+  const mins = Math.round((now - updated) / 60000);
+  const s = last.stall;
+  if (s.key !== mins) { s.key = mins; s.count = 0; s.at = 0; }   // 换了数值 = 新事件，重新计数
+  const gapOk = now - (s.at || 0) >= STALL_REPORT_GAP_MS;
+  if (s.count < STALL_REPORT_MAX && gapOk) {
+    alerts.push(`状态已经 ${mins} 分钟没更新，可能卡死（第 ${s.count + 1}/${STALL_REPORT_MAX} 次提醒）`);
+    s.count += 1;
+    s.at = now;
+  }
+} else {
+  last.stall = { key: null, count: 0, at: 0 };
+}
+
+/* ----------------------------- 4. 进度播报：每小时最多一次 ----------------------------- */
+const points = Number((st.progressText ?? "").match(/(\d+)\s*\/\s*(\d+)/)?.[1] ?? 0);
+if (points > (last.lastPoints ?? 0) && now - (last.lastReportAt ?? 0) > 60 * 60 * 1000) {
+  alerts.push(`进度播报：任务点 ${st.progressText}（已播 ${st.playedVideos ?? "?"} 个视频）`);
+  last.lastReportAt = now;
+}
+
+if (alerts.length) {
+  try {
+    enqueueNote({ chat: "private", target: "3573297011", kind: "reminder", text: `【挂课】${alerts.join("；")}` });
+  } catch { /* 便条失败不影响下次检查 */ }
+}
+
+fs.writeFileSync(LAST, JSON.stringify({ ...last, lastPoints: points, lastCheckAt: now }, null, 1));

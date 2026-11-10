@@ -24,9 +24,7 @@ const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
 function readPrompt(sub, name) {
   try { return fs.readFileSync(path.join(ROOT, "prompt", sub, name), "utf8"); } catch { return ""; }
 }
-let sys = readPrompt("agent", "system.md");
-const base2x = readPrompt("context", "2x.md");
-if (base2x) sys += "\n\n" + base2x;
+const sys = readPrompt("agent", "system.md");
 
 // ---- 2. 工具清单（从 prompt/tools/*.md 读 label）----
 const toolDir = path.join(ROOT, "prompt", "tools");
@@ -71,7 +69,7 @@ const outText = [
   `总消息行: ${entries.length}`,
   "=".repeat(60),
   "",
-  "## SYSTEM PROMPT（重建：agent/system.md + context/2x.md）",
+  "## SYSTEM PROMPT（重建：agent/system.md）",
   "=".repeat(60),
   sys,
   "",
